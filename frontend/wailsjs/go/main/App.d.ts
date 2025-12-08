@@ -15,11 +15,27 @@ export function GetBackupList():Promise<Array<main.BackupItem>>;
 
 export function GetCurrentMachineID():Promise<string>;
 
+export function GetCurrentProvider():Promise<string>;
+
+export function GetCurrentUsageInfo():Promise<main.CurrentUsageInfo>;
+
+export function GetDetectedKiroVersion():Promise<main.Result>;
+
 export function GetKiroProcesses():Promise<Array<kiroprocess.ProcessInfo>>;
+
+export function GetSettings():Promise<main.AppSettings>;
 
 export function GetSoftResetStatus():Promise<main.SoftResetStatus>;
 
 export function IsKiroRunning():Promise<boolean>;
+
+export function OpenExtensionFolder():Promise<main.Result>;
+
+export function OpenMachineIDFolder():Promise<main.Result>;
+
+export function OpenSSOCacheFolder():Promise<main.Result>;
+
+export function RefreshBackupUsage(arg1:string):Promise<main.UsageCacheResult>;
 
 export function RepatchExtension():Promise<main.Result>;
 
@@ -28,6 +44,8 @@ export function ResetToNewMachine():Promise<main.Result>;
 export function RestoreOriginal():Promise<main.Result>;
 
 export function RestoreSoftReset():Promise<main.Result>;
+
+export function SaveSettings(arg1:main.AppSettings):Promise<main.Result>;
 
 export function SoftResetToNewMachine():Promise<main.Result>;
 

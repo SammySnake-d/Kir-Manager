@@ -10,10 +10,12 @@ import (
 
 	"kiro-manager/awssso"
 	"kiro-manager/kiropath"
+	"kiro-manager/machineid"
 )
 
 const (
-	CustomMachineIDFileName = "custom-machine-id"
+	CustomMachineIDFileName    = "custom-machine-id"     // SHA256 雜湊後的值（給 Kiro 使用）
+	CustomMachineIDRawFileName = "custom-machine-id-raw" // 原始 UUID（給 UI 顯示）
 )
 
 var (
@@ -46,6 +48,15 @@ func GetCustomMachineIDPath() (string, error) {
 	return filepath.Join(kiroHome, CustomMachineIDFileName), nil
 }
 
+// GetCustomMachineIDRawPath 取得原始 Machine ID 檔案路徑 (~/.kiro/custom-machine-id-raw)
+func GetCustomMachineIDRawPath() (string, error) {
+	kiroHome, err := kiropath.GetKiroHomePath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(kiroHome, CustomMachineIDRawFileName), nil
+}
+
 // ReadCustomMachineID 讀取自訂 Machine ID（如果存在）
 func ReadCustomMachineID() (string, error) {
 	idPath, err := GetCustomMachineIDPath()
@@ -69,9 +80,48 @@ func ReadCustomMachineID() (string, error) {
 	return id, nil
 }
 
-// WriteCustomMachineID 寫入自訂 Machine ID
+// WriteCustomMachineID 寫入自訂 Machine ID（SHA256 雜湊後的值）
 func WriteCustomMachineID(machineID string) error {
 	idPath, err := GetCustomMachineIDPath()
+	if err != nil {
+		return err
+	}
+
+	// 確保 ~/.kiro 目錄存在
+	dir := filepath.Dir(idPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(idPath, []byte(machineID), 0644)
+}
+
+// ReadCustomMachineIDRaw 讀取原始 Machine ID（UUID 格式，用於 UI 顯示）
+func ReadCustomMachineIDRaw() (string, error) {
+	idPath, err := GetCustomMachineIDRawPath()
+	if err != nil {
+		return "", err
+	}
+
+	data, err := os.ReadFile(idPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", ErrCustomIDNotFound
+		}
+		return "", err
+	}
+
+	id := strings.TrimSpace(string(data))
+	if id == "" {
+		return "", ErrCustomIDNotFound
+	}
+
+	return id, nil
+}
+
+// WriteCustomMachineIDRaw 寫入原始 Machine ID（UUID 格式）
+func WriteCustomMachineIDRaw(machineID string) error {
+	idPath, err := GetCustomMachineIDRawPath()
 	if err != nil {
 		return err
 	}
@@ -92,16 +142,29 @@ func GenerateNewMachineID() string {
 
 // ClearCustomMachineID 刪除自訂 Machine ID 檔案（還原為系統原始值）
 func ClearCustomMachineID() error {
+	// 刪除 SHA256 雜湊檔案
 	idPath, err := GetCustomMachineIDPath()
 	if err != nil {
 		return err
 	}
-
-	if _, err := os.Stat(idPath); os.IsNotExist(err) {
-		return nil // 不存在就不需要刪除
+	if _, err := os.Stat(idPath); err == nil {
+		if err := os.Remove(idPath); err != nil {
+			return err
+		}
 	}
 
-	return os.Remove(idPath)
+	// 刪除原始 UUID 檔案
+	rawPath, err := GetCustomMachineIDRawPath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(rawPath); err == nil {
+		if err := os.Remove(rawPath); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // ClearSSOCache 刪除 SSO cache（複用 reset 模組的邏輯）
@@ -122,20 +185,30 @@ func ClearSSOCache() error {
 func SoftResetEnvironment() (*SoftResetResult, error) {
 	result := &SoftResetResult{}
 
-	// 1. 讀取舊的自訂 Machine ID（如果有）
-	oldID, _ := ReadCustomMachineID()
+	// 1. 讀取舊的原始 Machine ID（如果有，用於 UI 顯示）
+	oldID, _ := ReadCustomMachineIDRaw()
 	result.OldMachineID = oldID
 
-	// 2. 生成新的 Machine ID
-	newID := GenerateNewMachineID()
-	result.NewMachineID = newID
+	// 2. 生成新的 Machine ID（UUID v4）
+	rawID := GenerateNewMachineID()
 
-	// 3. 寫入自訂 Machine ID 檔案
-	if err := WriteCustomMachineID(newID); err != nil {
+	// 3. 將 UUID 經過 SHA256 雜湊（Kiro 使用雜湊後的值）
+	hashedID := machineid.HashMachineID(rawID)
+
+	// 4. 返回原始 UUID（用於 UI 顯示）
+	result.NewMachineID = rawID
+
+	// 5. 寫入自訂 Machine ID 檔案（雜湊後的值，給 Kiro 使用）
+	if err := WriteCustomMachineID(hashedID); err != nil {
 		return result, err
 	}
 
-	// 4. Patch extension.js（如果尚未 patch）
+	// 6. 寫入原始 Machine ID 檔案（UUID 格式，給 UI 顯示）
+	if err := WriteCustomMachineIDRaw(rawID); err != nil {
+		return result, err
+	}
+
+	// 7. Patch extension.js（如果尚未 patch）
 	patched, err := IsPatched()
 	if err != nil {
 		return result, err
@@ -166,8 +239,20 @@ func RestoreOriginalMachineID() error {
 		return err
 	}
 
-	// 2. 清除 SSO cache
-	return ClearSSOCache()
+	// 2. 從備份還原 extension.js
+	if err := RestoreExtensionJS(); err != nil {
+		// 如果備份不存在，嘗試移除 patch
+		if err == ErrBackupNotFound {
+			_ = UnpatchExtensionJS() // 忽略錯誤
+		} else if err != ErrExtensionNotFound {
+			return err
+		}
+	}
+
+	// 注意：SSO cache 的恢復邏輯由呼叫端（app.go）處理
+	// 因為需要比對備份的 Machine ID，這是 backup 模組的職責
+
+	return nil
 }
 
 // GetSoftResetStatus 取得軟重置狀態
@@ -180,11 +265,18 @@ func GetSoftResetStatus() (*SoftResetStatus, error) {
 		status.IsPatched = patched
 	}
 
-	// 檢查自訂 Machine ID
-	customID, err := ReadCustomMachineID()
+	// 檢查自訂 Machine ID（優先讀取原始 UUID，用於 UI 顯示）
+	rawID, err := ReadCustomMachineIDRaw()
 	if err == nil {
 		status.HasCustomID = true
-		status.CustomMachineID = customID
+		status.CustomMachineID = rawID
+	} else {
+		// 向後兼容：如果沒有 raw 檔案，嘗試讀取雜湊檔案
+		hashedID, err := ReadCustomMachineID()
+		if err == nil {
+			status.HasCustomID = true
+			status.CustomMachineID = hashedID
+		}
 	}
 
 	// 取得 extension.js 路徑

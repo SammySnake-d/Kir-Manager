@@ -3,14 +3,21 @@ package main
 import (
 	"context"
 	"fmt"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"time"
 
+	"kiro-manager/awssso"
 	"kiro-manager/backup"
 	"kiro-manager/kiroprocess"
+	"kiro-manager/kiroversion"
 	"kiro-manager/machineid"
-	"kiro-manager/reset"
+	// "kiro-manager/reset" // 暫時停用硬一鍵新機功能
+	"kiro-manager/settings"
 	"kiro-manager/softreset"
+	"kiro-manager/tokenrefresh"
+	"kiro-manager/usage"
 )
 
 // App struct
@@ -32,14 +39,22 @@ func (a *App) startup(ctx context.Context) {
 
 // BackupItem 備份項目（前端用）
 type BackupItem struct {
-	Name              string `json:"name"`
-	BackupTime        string `json:"backupTime"`
-	HasToken          bool   `json:"hasToken"`
-	HasMachineID      bool   `json:"hasMachineId"`
-	MachineID         string `json:"machineId"`
-	Provider          string `json:"provider"`
-	IsCurrent         bool   `json:"isCurrent"`
-	IsOriginalMachine bool   `json:"isOriginalMachine"` // Machine ID 與原始機器相同
+	Name              string  `json:"name"`
+	BackupTime        string  `json:"backupTime"`
+	HasToken          bool    `json:"hasToken"`
+	HasMachineID      bool    `json:"hasMachineId"`
+	MachineID         string  `json:"machineId"`
+	Provider          string  `json:"provider"`
+	IsCurrent         bool    `json:"isCurrent"`
+	IsOriginalMachine bool    `json:"isOriginalMachine"` // Machine ID 與原始機器相同
+	IsTokenExpired    bool    `json:"isTokenExpired"`    // Token 是否已過期
+	// Usage 相關欄位 (Requirements: 1.1, 1.2)
+	SubscriptionTitle string  `json:"subscriptionTitle"` // 訂閱類型名稱
+	UsageLimit        float64 `json:"usageLimit"`        // 總額度
+	CurrentUsage      float64 `json:"currentUsage"`      // 已使用
+	Balance           float64 `json:"balance"`           // 餘額
+	IsLowBalance      bool    `json:"isLowBalance"`      // 餘額低於 20%
+	CachedAt          string  `json:"cachedAt"`          // 緩存時間（用於前端判斷冷卻期）
 }
 
 // Result 通用回傳結果
@@ -90,13 +105,35 @@ func (a *App) GetBackupList() ([]BackupItem, error) {
 			}
 		}
 
-		// 讀取 token 中的 provider
+		// 讀取 token 中的 provider 和過期狀態
 		if b.HasToken {
 			token, err := backup.ReadBackupToken(b.Name)
-			if err == nil && token.Provider != "" {
-				item.Provider = token.Provider
+			if err == nil && token != nil {
+				if token.Provider != "" {
+					item.Provider = token.Provider
+				}
+				// 檢查 token 是否已過期
+				item.IsTokenExpired = awssso.IsTokenExpired(token)
 			}
 		}
+
+		// 從緩存讀取用量資訊（不再自動呼叫 API）
+		if usageCache, err := backup.ReadUsageCache(b.Name); err == nil && usageCache != nil {
+			item.SubscriptionTitle = usageCache.SubscriptionTitle
+			item.UsageLimit = usageCache.UsageLimit
+			item.CurrentUsage = usageCache.CurrentUsage
+			item.Balance = usageCache.Balance
+			// 使用設定的閾值重新計算 IsLowBalance
+			threshold := settings.GetLowBalanceThreshold()
+			if usageCache.UsageLimit > 0 {
+				item.IsLowBalance = (usageCache.Balance / usageCache.UsageLimit) < threshold
+			}
+			// 傳遞緩存時間供前端判斷冷卻期
+			if !usageCache.CachedAt.IsZero() {
+				item.CachedAt = usageCache.CachedAt.Format(time.RFC3339)
+			}
+		}
+		// 沒有緩存的備份，用量欄位保持零值（前端顯示 "-"）
 
 		items = append(items, item)
 	}
@@ -104,6 +141,124 @@ func (a *App) GetBackupList() ([]BackupItem, error) {
 	return items, nil
 }
 
+// UsageCacheResult 餘額刷新結果
+type UsageCacheResult struct {
+	Success           bool    `json:"success"`
+	Message           string  `json:"message"`
+	SubscriptionTitle string  `json:"subscriptionTitle"`
+	UsageLimit        float64 `json:"usageLimit"`
+	CurrentUsage      float64 `json:"currentUsage"`
+	Balance           float64 `json:"balance"`
+	IsLowBalance      bool    `json:"isLowBalance"`
+	IsTokenExpired    bool    `json:"isTokenExpired"` // Token 是否已過期（刷新成功後為 false）
+	CachedAt          string  `json:"cachedAt"`       // 緩存時間（用於前端判斷冷卻期）
+}
+
+// RefreshBackupUsage 刷新指定備份的餘額資訊
+// 需求: 1.1, 1.2, 1.3, 1.4, 1.5
+func (a *App) RefreshBackupUsage(name string) UsageCacheResult {
+	if name == "" {
+		return UsageCacheResult{Success: false, Message: "備份名稱不能為空"}
+	}
+
+	if !backup.BackupExists(name) {
+		return UsageCacheResult{Success: false, Message: "備份不存在"}
+	}
+
+	// 先讀取備份的 Machine ID（用於 Token 刷新和 API 呼叫）
+	mid, err := backup.ReadBackupMachineID(name)
+	if err != nil {
+		return UsageCacheResult{Success: false, Message: "無法讀取備份的 Machine ID"}
+	}
+	hashedMachineID := machineid.HashMachineID(mid.MachineID)
+
+	// 讀取備份的 token
+	token, err := backup.ReadBackupToken(name)
+	if err != nil {
+		return UsageCacheResult{Success: false, Message: "無法讀取備份的 token"}
+	}
+
+	// 檢查 token 是否已過期（需求 1.1）
+	if awssso.IsTokenExpired(token) {
+		// 嘗試刷新 Token（需求 1.1, 1.2, 1.3）
+		// 使用對應環境快照的 Machine ID 的 SHA256 雜湊值
+		var newTokenInfo *tokenrefresh.TokenInfo
+		var err error
+
+		// 檢查是否為 IdC 認證，如果是則從備份目錄讀取 clientId/clientSecret
+		authType := tokenrefresh.DetectAuthType(token)
+		if authType == "idc" && token.ClientIdHash != "" {
+			// 從備份目錄讀取 IdC credentials
+			clientID, clientSecret, credErr := backup.ReadBackupIdCCredentials(name, token.ClientIdHash)
+			if credErr != nil {
+				return UsageCacheResult{Success: false, Message: "無法讀取 IdC 認證資訊: " + credErr.Error()}
+			}
+			newTokenInfo, err = tokenrefresh.RefreshAccessTokenFromBackup(token, hashedMachineID, clientID, clientSecret)
+		} else {
+			// Social 認證或其他情況，使用原有邏輯
+			newTokenInfo, err = tokenrefresh.RefreshAccessToken(token, hashedMachineID)
+		}
+
+		if err != nil {
+			// 刷新失敗，返回錯誤（需求 1.5）
+			return UsageCacheResult{Success: false, Message: err.Error()}
+		}
+
+		// 更新 token 結構的新值（需求 1.2, 1.3）
+		token.AccessToken = newTokenInfo.AccessToken
+		token.ExpiresAt = newTokenInfo.ExpiresAt.UTC().Format("2006-01-02T15:04:05.000Z")
+
+		// 呼叫 WriteBackupToken() 持久化刷新後的 token（需求 3.1, 3.2）
+		if err := backup.WriteBackupToken(name, token.AccessToken, token.ExpiresAt); err != nil {
+			return UsageCacheResult{Success: false, Message: "Token 刷新成功但寫入失敗: " + err.Error()}
+		}
+	}
+
+	// 呼叫 API 取得用量資訊（需求 1.4）
+	// hashedMachineID 已在上方計算
+	usageInfo, err := usage.GetUsageLimitsWithMachineID(token, hashedMachineID)
+	if err != nil {
+		return UsageCacheResult{Success: false, Message: fmt.Sprintf("API 呼叫失敗: %v", err)}
+	}
+
+	if usageInfo == nil || usageInfo.SubscriptionTitle == "" {
+		return UsageCacheResult{Success: false, Message: "無法取得用量資訊"}
+	}
+
+	// 使用設定的閾值重新計算 IsLowBalance
+	threshold := settings.GetLowBalanceThreshold()
+	isLowBalance := false
+	if usageInfo.UsageLimit > 0 {
+		isLowBalance = (usageInfo.Balance / usageInfo.UsageLimit) < threshold
+	}
+
+	// 寫入緩存
+	cache := &backup.UsageCache{
+		SubscriptionTitle: usageInfo.SubscriptionTitle,
+		UsageLimit:        usageInfo.UsageLimit,
+		CurrentUsage:      usageInfo.CurrentUsage,
+		Balance:           usageInfo.Balance,
+		IsLowBalance:      isLowBalance,
+	}
+	if err := backup.WriteUsageCache(name, cache); err != nil {
+		return UsageCacheResult{Success: false, Message: fmt.Sprintf("緩存寫入失敗: %v", err)}
+	}
+
+	// 緩存時間為當前時間（WriteUsageCache 會設定 CachedAt）
+	cachedAt := time.Now().Format(time.RFC3339)
+
+	return UsageCacheResult{
+		Success:           true,
+		Message:           "刷新成功",
+		SubscriptionTitle: usageInfo.SubscriptionTitle,
+		UsageLimit:        usageInfo.UsageLimit,
+		CurrentUsage:      usageInfo.CurrentUsage,
+		Balance:           usageInfo.Balance,
+		IsLowBalance:      isLowBalance,
+		IsTokenExpired:    false, // 刷新成功代表 token 有效
+		CachedAt:          cachedAt,
+	}
+}
 
 // CreateBackup 建立新備份
 func (a *App) CreateBackup(name string) Result {
@@ -119,6 +274,7 @@ func (a *App) CreateBackup(name string) Result {
 }
 
 // SwitchToBackup 切換至指定備份帳號
+// 注意：硬一鍵新機功能暫時停用，此函數目前僅恢復 token
 func (a *App) SwitchToBackup(name string) Result {
 	if name == "" {
 		return Result{Success: false, Message: "請選擇備份"}
@@ -135,66 +291,20 @@ func (a *App) SwitchToBackup(name string) Result {
 		}
 	}
 
-	// 讀取備份的 Machine ID
-	mid, err := backup.ReadBackupMachineID(name)
-	if err != nil {
-		return Result{Success: false, Message: fmt.Sprintf("讀取備份失敗: %v", err)}
-	}
-
-	// 檢查平台
-	if runtime.GOOS != "windows" {
-		return Result{Success: false, Message: "僅支援 Windows 平台"}
-	}
-
-	// 設定 Machine ID
-	if err := reset.SetWindowsMachineID(mid.MachineID); err != nil {
-		if err == reset.ErrRequiresAdmin {
-			return Result{Success: false, Message: "需要管理員權限"}
-		}
-		return Result{Success: false, Message: err.Error()}
-	}
-
-	// 恢復 token
+	// 硬一鍵新機功能暫時停用，不再修改系統 Machine ID
+	// 僅恢復 token
 	if err := backup.RestoreBackup(name); err != nil {
 		return Result{Success: false, Message: fmt.Sprintf("恢復 Token 失敗: %v", err)}
 	}
 
-	return Result{Success: true, Message: "切換成功"}
+	return Result{Success: true, Message: "切換成功（僅恢復 Token，Machine ID 未變更）"}
 }
 
 // RestoreOriginal 還原原始機器（僅還原 Machine ID，不涉及 token）
+// 注意：硬一鍵新機功能暫時停用，此函數目前無法使用
 func (a *App) RestoreOriginal() Result {
-	// 檢測並強制關閉 Kiro
-	if kiroprocess.IsKiroRunning() {
-		killed, err := kiroprocess.KillKiroProcesses()
-		if err != nil {
-			return Result{Success: false, Message: fmt.Sprintf("關閉 Kiro 失敗: %v", err)}
-		}
-		if killed == 0 && kiroprocess.IsKiroRunning() {
-			return Result{Success: false, Message: "無法關閉 Kiro，請手動關閉後重試"}
-		}
-	}
-
-	// 讀取原始備份的 Machine ID
-	mid, err := backup.ReadBackupMachineID(backup.OriginalBackupName)
-	if err != nil {
-		return Result{Success: false, Message: fmt.Sprintf("讀取原始備份失敗: %v", err)}
-	}
-
-	// 檢查平台
-	if runtime.GOOS != "windows" {
-		return Result{Success: false, Message: "僅支援 Windows 平台"}
-	}
-
-	// 僅還原 Machine ID，不還原 token
-	if err := reset.SetWindowsMachineID(mid.MachineID); err != nil {
-		if err == reset.ErrRequiresAdmin {
-			return Result{Success: false, Message: "需要管理員權限"}
-		}
-		return Result{Success: false, Message: err.Error()}
-	}
-
-	return Result{Success: true, Message: "已還原出廠設定"}
+	// 硬一鍵新機功能暫時停用
+	return Result{Success: false, Message: "硬一鍵新機功能暫時停用，請使用軟一鍵新機的「還原」功能"}
 }
 
 // DeleteBackup 刪除備份
@@ -238,45 +348,126 @@ func (a *App) EnsureOriginalBackup() Result {
 	return Result{Success: true, Message: "原始備份已存在"}
 }
 
-// ResetToNewMachine 一鍵新機
+// ResetToNewMachine 一鍵新機（硬重置）
+// 注意：硬一鍵新機功能暫時停用，請使用軟一鍵新機
 func (a *App) ResetToNewMachine() Result {
-	// 檢測並強制關閉 Kiro
-	if kiroprocess.IsKiroRunning() {
-		killed, err := kiroprocess.KillKiroProcesses()
-		if err != nil {
-			return Result{Success: false, Message: fmt.Sprintf("關閉 Kiro 失敗: %v", err)}
-		}
-		if killed == 0 && kiroprocess.IsKiroRunning() {
-			return Result{Success: false, Message: "無法關閉 Kiro，請手動關閉後重試"}
-		}
-	}
-
-	// 先確保原始備份存在
-	if _, err := backup.EnsureOriginalBackup(); err != nil {
-		return Result{Success: false, Message: fmt.Sprintf("備份失敗: %v", err)}
-	}
-
-	result, err := reset.ResetEnvironment(true)
-	if err != nil {
-		if err == reset.ErrRequiresAdmin {
-			return Result{Success: false, Message: "需要管理員權限"}
-		}
-		return Result{Success: false, Message: err.Error()}
-	}
-
-	return Result{
-		Success: true,
-		Message: fmt.Sprintf("重置成功！新 Machine ID: %s", result.NewMachineID[:8]+"..."),
-	}
+	// 硬一鍵新機功能暫時停用
+	return Result{Success: false, Message: "硬一鍵新機功能暫時停用，請使用軟一鍵新機"}
 }
 
 // GetAppInfo 取得應用資訊
 func (a *App) GetAppInfo() map[string]string {
 	return map[string]string{
-		"version":   "0.1.1",
+		"version":   "0.2.0",
 		"platform":  runtime.GOOS,
-		"buildTime": time.Now().Format("2006-01-02"),
+		"buildTime": time.Now().Format("2025-12-07"),
 	}
+}
+
+// GetCurrentProvider 取得當前 Kiro 登入的帳號來源（Provider）
+// 讀取 ~/.aws/sso/cache/kiro-auth-token.json 中的 provider 欄位
+func (a *App) GetCurrentProvider() string {
+	token, err := awssso.ReadKiroAuthToken()
+	if err != nil {
+		return ""
+	}
+	return token.Provider
+}
+
+// CurrentUsageInfo 當前帳號用量資訊（前端用）
+type CurrentUsageInfo struct {
+	SubscriptionTitle string  `json:"subscriptionTitle"` // 訂閱類型名稱
+	UsageLimit        float64 `json:"usageLimit"`        // 總額度
+	CurrentUsage      float64 `json:"currentUsage"`      // 已使用
+	Balance           float64 `json:"balance"`           // 餘額
+	IsLowBalance      bool    `json:"isLowBalance"`      // 餘額低於 20%
+}
+
+// GetCurrentUsageInfo 取得當前帳號的用量資訊
+// 讀取當前 Kiro 登入的 token，優先從緩存讀取，緩存不存在時呼叫 API
+func (a *App) GetCurrentUsageInfo() *CurrentUsageInfo {
+	// 取得當前 Machine ID（優先使用軟重置的自訂 ID）
+	currentMachineID := a.GetCurrentMachineID()
+	threshold := settings.GetLowBalanceThreshold()
+
+	// 查找當前 Machine ID 對應的備份
+	backupName := a.findBackupByMachineID(currentMachineID)
+	if backupName != "" {
+		// 優先從緩存讀取
+		if usageCache, err := backup.ReadUsageCache(backupName); err == nil && usageCache != nil {
+			// 使用設定的閾值重新計算 IsLowBalance
+			isLowBalance := false
+			if usageCache.UsageLimit > 0 {
+				isLowBalance = (usageCache.Balance / usageCache.UsageLimit) < threshold
+			}
+			return &CurrentUsageInfo{
+				SubscriptionTitle: usageCache.SubscriptionTitle,
+				UsageLimit:        usageCache.UsageLimit,
+				CurrentUsage:      usageCache.CurrentUsage,
+				Balance:           usageCache.Balance,
+				IsLowBalance:      isLowBalance,
+			}
+		}
+	}
+
+	// 緩存不存在，呼叫 API
+	token, err := awssso.ReadKiroAuthToken()
+	if err != nil {
+		return nil
+	}
+
+	hashedMachineID := machineid.HashMachineID(currentMachineID)
+	usageInfo := usage.GetUsageLimitsSafeWithMachineID(token, hashedMachineID)
+	if usageInfo == nil || usageInfo.SubscriptionTitle == "" {
+		return nil
+	}
+
+	// 使用設定的閾值重新計算 IsLowBalance
+	isLowBalance := false
+	if usageInfo.UsageLimit > 0 {
+		isLowBalance = (usageInfo.Balance / usageInfo.UsageLimit) < threshold
+	}
+
+	// 如果找到對應的備份，將結果寫入緩存
+	if backupName != "" {
+		cache := &backup.UsageCache{
+			SubscriptionTitle: usageInfo.SubscriptionTitle,
+			UsageLimit:        usageInfo.UsageLimit,
+			CurrentUsage:      usageInfo.CurrentUsage,
+			Balance:           usageInfo.Balance,
+			IsLowBalance:      isLowBalance,
+		}
+		backup.WriteUsageCache(backupName, cache)
+	}
+
+	return &CurrentUsageInfo{
+		SubscriptionTitle: usageInfo.SubscriptionTitle,
+		UsageLimit:        usageInfo.UsageLimit,
+		CurrentUsage:      usageInfo.CurrentUsage,
+		Balance:           usageInfo.Balance,
+		IsLowBalance:      isLowBalance,
+	}
+}
+
+// findBackupByMachineID 根據 Machine ID 查找對應的備份名稱
+func (a *App) findBackupByMachineID(machineID string) string {
+	backups, err := backup.ListBackups()
+	if err != nil {
+		return ""
+	}
+
+	for _, b := range backups {
+		if b.Name == backup.OriginalBackupName {
+			continue
+		}
+		if b.HasMachineID {
+			mid, err := backup.ReadBackupMachineID(b.Name)
+			if err == nil && mid.MachineID == machineID {
+				return b.Name
+			}
+		}
+	}
+	return ""
 }
 
 // IsKiroRunning 檢查 Kiro 是否正在運行
@@ -365,8 +556,33 @@ func (a *App) RestoreSoftReset() Result {
 		}
 	}
 
+	// 執行還原（刪除自訂 Machine ID、還原 extension.js）
 	if err := softreset.RestoreOriginalMachineID(); err != nil {
 		return Result{Success: false, Message: err.Error()}
+	}
+
+	// 取得系統原始 Machine ID（原始 UUID，用於比對備份）
+	originalMachineID, err := machineid.GetRawMachineId()
+	if err != nil {
+		return Result{Success: true, Message: "已還原為系統原始 Machine ID（無法讀取機器碼）"}
+	}
+
+	// 比對備份，找到使用相同機器碼的備份並恢復
+	backups, err := backup.ListBackups()
+	if err == nil {
+		for _, b := range backups {
+			backupMID, err := backup.ReadBackupMachineID(b.Name)
+			if err == nil && backupMID.MachineID == originalMachineID {
+				// 找到匹配的備份，恢復 SSO cache（token）
+				if err := backup.RestoreBackup(b.Name); err == nil {
+					return Result{
+						Success: true,
+						Message: fmt.Sprintf("已還原為系統原始 Machine ID，並恢復帳號「%s」", b.Name),
+					}
+				}
+				break
+			}
+		}
 	}
 
 	return Result{Success: true, Message: "已還原為系統原始 Machine ID"}
@@ -410,4 +626,104 @@ func (a *App) UnpatchExtension() Result {
 	}
 
 	return Result{Success: true, Message: "已移除 Patch"}
+}
+
+// ============================================================================
+// 全域設定功能
+// ============================================================================
+
+// AppSettings 應用設定（前端用）
+type AppSettings struct {
+	LowBalanceThreshold float64 `json:"lowBalanceThreshold"` // 低餘額閾值（0.0 ~ 1.0）
+	KiroVersion         string  `json:"kiroVersion"`         // Kiro IDE 版本號
+	UseAutoDetect       bool    `json:"useAutoDetect"`       // 是否使用自動偵測版本號
+}
+
+// GetSettings 取得全域設定
+func (a *App) GetSettings() AppSettings {
+	s := settings.GetCurrentSettings()
+	return AppSettings{
+		LowBalanceThreshold: s.LowBalanceThreshold,
+		KiroVersion:         s.KiroVersion,
+		UseAutoDetect:       s.UseAutoDetect,
+	}
+}
+
+// SaveSettings 儲存全域設定
+func (a *App) SaveSettings(appSettings AppSettings) Result {
+	s := &settings.Settings{
+		LowBalanceThreshold: appSettings.LowBalanceThreshold,
+		KiroVersion:         appSettings.KiroVersion,
+		UseAutoDetect:       appSettings.UseAutoDetect,
+	}
+	if err := settings.SaveSettings(s); err != nil {
+		return Result{Success: false, Message: fmt.Sprintf("儲存設定失敗: %v", err)}
+	}
+	return Result{Success: true, Message: "設定已儲存"}
+}
+
+// GetDetectedKiroVersion 自動偵測 Kiro IDE 執行檔的版本號
+func (a *App) GetDetectedKiroVersion() Result {
+	version, err := kiroversion.GetKiroVersion()
+	if err != nil {
+		return Result{Success: false, Message: fmt.Sprintf("偵測版本失敗: %v", err)}
+	}
+	return Result{Success: true, Message: version}
+}
+
+// OpenExtensionFolder 打開 extension.js 所在的文件夾
+func (a *App) OpenExtensionFolder() Result {
+	extPath, err := softreset.GetExtensionJSPath()
+	if err != nil {
+		return Result{Success: false, Message: fmt.Sprintf("無法取得 extension.js 路徑: %v", err)}
+	}
+
+	// 取得文件夾路徑
+	folderPath := filepath.Dir(extPath)
+
+	return openFolder(folderPath)
+}
+
+// OpenMachineIDFolder 打開自訂 Machine ID 所在的文件夾 (~/.kiro)
+func (a *App) OpenMachineIDFolder() Result {
+	idPath, err := softreset.GetCustomMachineIDPath()
+	if err != nil {
+		return Result{Success: false, Message: fmt.Sprintf("無法取得 Machine ID 路徑: %v", err)}
+	}
+
+	// 取得文件夾路徑 (~/.kiro)
+	folderPath := filepath.Dir(idPath)
+
+	return openFolder(folderPath)
+}
+
+// OpenSSOCacheFolder 打開 AWS SSO Cache 所在的文件夾 (~/.aws/sso/cache)
+func (a *App) OpenSSOCacheFolder() Result {
+	cachePath, err := awssso.GetSSOCachePath()
+	if err != nil {
+		return Result{Success: false, Message: fmt.Sprintf("無法取得 SSO Cache 路徑: %v", err)}
+	}
+
+	return openFolder(cachePath)
+}
+
+// openFolder 使用系統檔案管理器打開指定文件夾
+func openFolder(folderPath string) Result {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("explorer", folderPath)
+	case "darwin":
+		cmd = exec.Command("open", folderPath)
+	case "linux":
+		cmd = exec.Command("xdg-open", folderPath)
+	default:
+		return Result{Success: false, Message: "不支援的平台"}
+	}
+
+	if err := cmd.Start(); err != nil {
+		return Result{Success: false, Message: fmt.Sprintf("無法打開文件夾: %v", err)}
+	}
+
+	return Result{Success: true, Message: "已打開文件夾"}
 }

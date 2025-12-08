@@ -34,3 +34,9 @@ func hashSHA256(data string) string {
 	hash := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(hash[:])
 }
+
+// HashMachineID 將原始 Machine ID 轉換為 SHA-256 雜湊值
+// 用於將備份中的原始 Machine ID 轉換為 API 所需的格式
+func HashMachineID(rawMachineID string) string {
+	return hashSHA256(rawMachineID)
+}

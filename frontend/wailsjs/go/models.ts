@@ -19,6 +19,22 @@ export namespace kiroprocess {
 
 export namespace main {
 	
+	export class AppSettings {
+	    lowBalanceThreshold: number;
+	    kiroVersion: string;
+	    useAutoDetect: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new AppSettings(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.lowBalanceThreshold = source["lowBalanceThreshold"];
+	        this.kiroVersion = source["kiroVersion"];
+	        this.useAutoDetect = source["useAutoDetect"];
+	    }
+	}
 	export class BackupItem {
 	    name: string;
 	    backupTime: string;
@@ -28,6 +44,13 @@ export namespace main {
 	    provider: string;
 	    isCurrent: boolean;
 	    isOriginalMachine: boolean;
+	    isTokenExpired: boolean;
+	    subscriptionTitle: string;
+	    usageLimit: number;
+	    currentUsage: number;
+	    balance: number;
+	    isLowBalance: boolean;
+	    cachedAt: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new BackupItem(source);
@@ -43,6 +66,33 @@ export namespace main {
 	        this.provider = source["provider"];
 	        this.isCurrent = source["isCurrent"];
 	        this.isOriginalMachine = source["isOriginalMachine"];
+	        this.isTokenExpired = source["isTokenExpired"];
+	        this.subscriptionTitle = source["subscriptionTitle"];
+	        this.usageLimit = source["usageLimit"];
+	        this.currentUsage = source["currentUsage"];
+	        this.balance = source["balance"];
+	        this.isLowBalance = source["isLowBalance"];
+	        this.cachedAt = source["cachedAt"];
+	    }
+	}
+	export class CurrentUsageInfo {
+	    subscriptionTitle: string;
+	    usageLimit: number;
+	    currentUsage: number;
+	    balance: number;
+	    isLowBalance: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new CurrentUsageInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.subscriptionTitle = source["subscriptionTitle"];
+	        this.usageLimit = source["usageLimit"];
+	        this.currentUsage = source["currentUsage"];
+	        this.balance = source["balance"];
+	        this.isLowBalance = source["isLowBalance"];
 	    }
 	}
 	export class Result {
@@ -77,6 +127,34 @@ export namespace main {
 	        this.customMachineId = source["customMachineId"];
 	        this.extensionPath = source["extensionPath"];
 	        this.isSupported = source["isSupported"];
+	    }
+	}
+	export class UsageCacheResult {
+	    success: boolean;
+	    message: string;
+	    subscriptionTitle: string;
+	    usageLimit: number;
+	    currentUsage: number;
+	    balance: number;
+	    isLowBalance: boolean;
+	    isTokenExpired: boolean;
+	    cachedAt: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new UsageCacheResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.success = source["success"];
+	        this.message = source["message"];
+	        this.subscriptionTitle = source["subscriptionTitle"];
+	        this.usageLimit = source["usageLimit"];
+	        this.currentUsage = source["currentUsage"];
+	        this.balance = source["balance"];
+	        this.isLowBalance = source["isLowBalance"];
+	        this.isTokenExpired = source["isTokenExpired"];
+	        this.cachedAt = source["cachedAt"];
 	    }
 	}
 

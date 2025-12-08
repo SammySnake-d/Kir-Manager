@@ -14,11 +14,33 @@ interface BackupItem {
   provider: string
   isCurrent: boolean
   isOriginalMachine: boolean // Machine ID 與原始機器相同
+  isTokenExpired: boolean    // Token 是否已過期
+  // Usage 相關欄位 (Requirements: 1.1, 1.2)
+  subscriptionTitle: string  // 訂閱類型名稱
+  usageLimit: number         // 總額度
+  currentUsage: number       // 已使用
+  balance: number            // 餘額
+  isLowBalance: boolean      // 餘額低於 20%
+  cachedAt: string           // 緩存時間（用於判斷冷卻期）
 }
 
 interface Result {
   success: boolean
   message: string
+}
+
+interface CurrentUsageInfo {
+  subscriptionTitle: string
+  usageLimit: number
+  currentUsage: number
+  balance: number
+  isLowBalance: boolean
+}
+
+interface AppSettings {
+  lowBalanceThreshold: number
+  kiroVersion: string
+  useAutoDetect: boolean
 }
 
 declare global {
@@ -30,6 +52,7 @@ declare global {
           CreateBackup(name: string): Promise<Result>
           SwitchToBackup(name: string): Promise<Result>
           RestoreOriginal(): Promise<Result>
+          RestoreSoftReset(): Promise<Result>
           DeleteBackup(name: string): Promise<Result>
           GetCurrentMachineID(): Promise<string>
           EnsureOriginalBackup(): Promise<Result>
@@ -43,6 +66,26 @@ declare global {
             extensionPath: string
             isSupported: boolean
           }>
+          GetCurrentProvider(): Promise<string>
+          GetCurrentUsageInfo(): Promise<CurrentUsageInfo | null>
+          RefreshBackupUsage(name: string): Promise<{
+            success: boolean
+            message: string
+            subscriptionTitle: string
+            usageLimit: number
+            currentUsage: number
+            balance: number
+            isLowBalance: boolean
+            isTokenExpired: boolean
+            cachedAt: string
+          }>
+          GetSettings(): Promise<AppSettings>
+          SaveSettings(settings: AppSettings): Promise<Result>
+          GetDetectedKiroVersion(): Promise<Result>
+          OpenExtensionFolder(): Promise<Result>
+          OpenMachineIDFolder(): Promise<Result>
+          OpenSSOCacheFolder(): Promise<Result>
+          RepatchExtension(): Promise<Result>
         }
       }
     }
@@ -51,6 +94,8 @@ declare global {
 
 const backups = ref<BackupItem[]>([])
 const currentMachineId = ref('')
+const currentProvider = ref('') // 當前 Kiro 登入的帳號來源
+const currentUsageInfo = ref<CurrentUsageInfo | null>(null) // 當前帳號用量資訊
 const loading = ref(false)
 const kiroRunning = ref(false)
 const showCreateModal = ref(false)
@@ -69,6 +114,17 @@ const showFirstTimeResetModal = ref(false)
 const showSettingsPanel = ref(false)
 const activeMenu = ref<'dashboard' | 'settings'>('dashboard')
 const resetting = ref(false) // 一鍵新機進行中狀態
+const refreshingBackup = ref<string | null>(null) // 正在刷新餘額的備份名稱
+const refreshingCurrent = ref(false) // 正在刷新當前帳號餘額
+const patching = ref(false) // Extension Patch 進行中狀態
+
+// 刷新冷卻期（60 秒）
+const REFRESH_COOLDOWN_SECONDS = 60
+const copiedMachineId = ref<string | null>(null) // 剛複製的機器碼 ID（用於顯示提示）
+
+// 倒計時狀態：key 為備份名稱，value 為剩餘秒數（0 表示無倒計時）
+const countdownTimers = ref<Record<string, number>>({})
+const countdownCurrentAccount = ref(0) // 當前帳號的倒計時秒數
 
 // 軟重置狀態
 const softResetStatus = ref<{
@@ -84,6 +140,70 @@ const softResetStatus = ref<{
   extensionPath: '',
   isSupported: false
 })
+
+// 全域設定
+const appSettings = ref<AppSettings>({
+  lowBalanceThreshold: 0.2,
+  kiroVersion: '0.7.5',
+  useAutoDetect: true
+})
+
+// Kiro 版本號輸入值
+const kiroVersionInput = ref('0.7.5')
+// 追蹤版本號是否被用戶手動修改（用於控制確認按鍵狀態）
+const kiroVersionModified = ref(false)
+
+// 低餘額閾值預覽值（拖動滑桿時實時更新）
+const thresholdPreview = ref(20)
+
+// 確認對話框狀態
+const confirmDialog = ref<{
+  show: boolean
+  title: string
+  message: string
+  type: 'warning' | 'danger' | 'info'
+  confirmText: string
+  cancelText: string
+  onConfirm: () => void
+  onCancel: () => void
+}>({
+  show: false,
+  title: '',
+  message: '',
+  type: 'warning',
+  confirmText: '',
+  cancelText: '',
+  onConfirm: () => {},
+  onCancel: () => {}
+})
+
+// 顯示確認對話框並返回 Promise
+const showConfirmDialog = (options: {
+  title: string
+  message: string
+  type?: 'warning' | 'danger' | 'info'
+  confirmText?: string
+  cancelText?: string
+}): Promise<boolean> => {
+  return new Promise((resolve) => {
+    confirmDialog.value = {
+      show: true,
+      title: options.title,
+      message: options.message,
+      type: options.type || 'warning',
+      confirmText: options.confirmText || t('backup.confirm'),
+      cancelText: options.cancelText || t('backup.cancel'),
+      onConfirm: () => {
+        confirmDialog.value.show = false
+        resolve(true)
+      },
+      onCancel: () => {
+        confirmDialog.value.show = false
+        resolve(false)
+      }
+    }
+  })
+}
 
 const activeBackup = computed(() => {
   return backups.value.find(b => b.isCurrent) || null
@@ -125,11 +245,109 @@ const loadBackups = async () => {
     backups.value = await window.go.main.App.GetBackupList() || []
     currentMachineId.value = await window.go.main.App.GetCurrentMachineID()
     softResetStatus.value = await window.go.main.App.GetSoftResetStatus()
+    currentProvider.value = await window.go.main.App.GetCurrentProvider()
+    currentUsageInfo.value = await window.go.main.App.GetCurrentUsageInfo()
+    appSettings.value = await window.go.main.App.GetSettings()
+    thresholdPreview.value = Math.round(appSettings.value.lowBalanceThreshold * 100)
+    kiroVersionInput.value = appSettings.value.kiroVersion || '0.7.5'
+    kiroVersionModified.value = false // 重置修改狀態
     await checkKiroStatus()
   } catch (e) {
     console.error(e)
   } finally {
     loading.value = false
+  }
+}
+
+const saveLowBalanceThreshold = async (value: number) => {
+  try {
+    const result = await window.go.main.App.SaveSettings({
+      lowBalanceThreshold: value,
+      kiroVersion: appSettings.value.kiroVersion,
+      useAutoDetect: appSettings.value.useAutoDetect
+    })
+    if (result.success) {
+      appSettings.value.lowBalanceThreshold = value
+      // 本地更新 isLowBalance 狀態，避免觸發全域 loading
+      backups.value.forEach(backup => {
+        if (backup.usageLimit > 0) {
+          backup.isLowBalance = (backup.balance / backup.usageLimit) < value
+        }
+      })
+      // 更新當前帳號的 isLowBalance
+      if (currentUsageInfo.value && currentUsageInfo.value.usageLimit > 0) {
+        currentUsageInfo.value.isLowBalance = 
+          (currentUsageInfo.value.balance / currentUsageInfo.value.usageLimit) < value
+      }
+    } else {
+      showToast(result.message, 'error')
+    }
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+const saveKiroVersion = async () => {
+  const version = kiroVersionInput.value.trim()
+  if (!version) return
+  
+  try {
+    // 儲存自定義版本時，關閉自動偵測模式
+    const result = await window.go.main.App.SaveSettings({
+      lowBalanceThreshold: appSettings.value.lowBalanceThreshold,
+      kiroVersion: version,
+      useAutoDetect: false
+    })
+    if (result.success) {
+      appSettings.value.kiroVersion = version
+      appSettings.value.useAutoDetect = false
+      kiroVersionModified.value = false // 儲存後重置修改狀態
+      showToast(t('message.success'), 'success')
+    } else {
+      showToast(result.message, 'error')
+    }
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+// 處理版本號輸入變更
+const onKiroVersionInput = () => {
+  kiroVersionModified.value = true
+}
+
+// 偵測版本中狀態
+const detectingVersion = ref(false)
+
+// 自動偵測 Kiro 版本並啟用自動偵測模式
+const detectKiroVersion = async () => {
+  detectingVersion.value = true
+  try {
+    const result = await window.go.main.App.GetDetectedKiroVersion()
+    if (result.success) {
+      kiroVersionInput.value = result.message
+      // 啟用自動偵測模式並儲存設定
+      const saveResult = await window.go.main.App.SaveSettings({
+        lowBalanceThreshold: appSettings.value.lowBalanceThreshold,
+        kiroVersion: result.message,
+        useAutoDetect: true
+      })
+      if (saveResult.success) {
+        appSettings.value.kiroVersion = result.message
+        appSettings.value.useAutoDetect = true
+        kiroVersionModified.value = false // 自動偵測後重置修改狀態
+        showToast(t('message.success'), 'success')
+      } else {
+        showToast(saveResult.message, 'error')
+      }
+    } else {
+      showToast(t('settings.detectVersionFailed'), 'error')
+    }
+  } catch (e) {
+    console.error(e)
+    showToast(t('settings.detectVersionFailed'), 'error')
+  } finally {
+    detectingVersion.value = false
   }
 }
 
@@ -153,7 +371,12 @@ const createBackup = async () => {
 }
 
 const switchToBackup = async (name: string) => {
-  if (!confirm(t('message.confirmSwitch', { name }))) return
+  const confirmed = await showConfirmDialog({
+    title: t('dialog.confirmTitle'),
+    message: t('message.confirmSwitch', { name }),
+    type: 'warning'
+  })
+  if (!confirmed) return
   
   loading.value = true
   try {
@@ -170,11 +393,21 @@ const switchToBackup = async (name: string) => {
 }
 
 const restoreOriginal = async () => {
-  if (!confirm(t('message.confirmRestore'))) return
+  const confirmed = await showConfirmDialog({
+    title: t('dialog.warningTitle'),
+    message: t('message.confirmRestore'),
+    type: 'warning'
+  })
+  if (!confirmed) return
   
   loading.value = true
   try {
-    const result = await window.go.main.App.RestoreOriginal()
+    let result: Result
+    if (resetMode.value === 'soft') {
+      result = await window.go.main.App.RestoreSoftReset()
+    } else {
+      result = await window.go.main.App.RestoreOriginal()
+    }
     if (result.success) {
       showToast(t('message.restartKiro'), 'success')
       await loadBackups()
@@ -193,7 +426,12 @@ const resetToNew = async () => {
     return
   }
   
-  if (!confirm(t('message.confirmReset'))) return
+  const confirmed = await showConfirmDialog({
+    title: t('dialog.warningTitle'),
+    message: t('message.confirmReset'),
+    type: 'warning'
+  })
+  if (!confirmed) return
   
   await executeReset()
 }
@@ -224,17 +462,29 @@ const executeReset = async () => {
 
 const confirmFirstTimeReset = async () => {
   showFirstTimeResetModal.value = false
-  if (!confirm(t('message.confirmReset'))) return
+  const confirmed = await showConfirmDialog({
+    title: t('dialog.warningTitle'),
+    message: t('message.confirmReset'),
+    type: 'warning'
+  })
+  if (!confirmed) return
   await executeReset()
 }
 
-const setResetMode = (mode: 'soft' | 'hard') => {
-  resetMode.value = mode
-  localStorage.setItem('kiro-manager-reset-mode', mode)
+const setResetMode = (_mode: 'soft' | 'hard') => {
+  // 硬一鍵新機暫時停用，強制使用軟一鍵新機
+  // _mode 參數保留以維持 API 相容性，但目前不使用
+  resetMode.value = 'soft'
+  localStorage.setItem('kiro-manager-reset-mode', 'soft')
 }
 
 const deleteBackup = async (name: string) => {
-  if (!confirm(t('message.confirmDelete', { name }))) return
+  const confirmed = await showConfirmDialog({
+    title: t('dialog.deleteTitle'),
+    message: t('message.confirmDelete', { name }),
+    type: 'danger'
+  })
+  if (!confirmed) return
   
   loading.value = true
   try {
@@ -250,6 +500,210 @@ const deleteBackup = async (name: string) => {
   }
 }
 
+// 截取機器碼 ID 的首兩節（例如 4fa2ec40-7c9e-... → 4fa2ec40-7c9e...）
+const truncateMachineId = (machineId: string): string => {
+  if (!machineId) return '-'
+  const parts = machineId.split('-')
+  if (parts.length >= 2) {
+    return `${parts[0]}-${parts[1]}...`
+  }
+  // 如果不是 UUID 格式，顯示前 13 個字元
+  return machineId.length > 13 ? `${machineId.substring(0, 13)}...` : machineId
+}
+
+// 複製機器碼 ID 到剪貼簿
+const copyMachineId = async (machineId: string) => {
+  if (!machineId) return
+  try {
+    await navigator.clipboard.writeText(machineId)
+    copiedMachineId.value = machineId
+    setTimeout(() => {
+      copiedMachineId.value = null
+    }, 2000)
+  } catch (e) {
+    console.error('Failed to copy machine ID:', e)
+  }
+}
+
+// 判斷備份是否在冷卻期內（使用倒計時狀態）
+const isInCooldown = (backupName: string): boolean => {
+  return (countdownTimers.value[backupName] || 0) > 0
+}
+
+// 判斷當前帳號是否在冷卻期內
+const isCurrentInCooldown = (): boolean => {
+  return countdownCurrentAccount.value > 0
+}
+
+// 啟動倒計時
+const startCountdown = (backupName: string) => {
+  countdownTimers.value[backupName] = REFRESH_COOLDOWN_SECONDS
+  const interval = setInterval(() => {
+    if (countdownTimers.value[backupName] > 0) {
+      countdownTimers.value[backupName]--
+    } else {
+      clearInterval(interval)
+    }
+  }, 1000)
+}
+
+// 啟動當前帳號的倒計時
+const startCurrentCountdown = () => {
+  countdownCurrentAccount.value = REFRESH_COOLDOWN_SECONDS
+  const interval = setInterval(() => {
+    if (countdownCurrentAccount.value > 0) {
+      countdownCurrentAccount.value--
+    } else {
+      clearInterval(interval)
+    }
+  }, 1000)
+}
+
+const refreshBackupUsage = async (name: string) => {
+  // 檢查冷卻期
+  if (isInCooldown(name)) {
+    return
+  }
+
+  const backup = backups.value.find(b => b.name === name)
+  
+  // 如果是當前帳號，也檢查當前帳號的冷卻狀態
+  if (backup?.isCurrent && isCurrentInCooldown()) {
+    return
+  }
+  refreshingBackup.value = name
+  try {
+    const result = await window.go.main.App.RefreshBackupUsage(name)
+    if (result.success) {
+      // 更新本地備份列表中的餘額資訊
+      if (backup) {
+        backup.subscriptionTitle = result.subscriptionTitle
+        backup.usageLimit = result.usageLimit
+        backup.currentUsage = result.currentUsage
+        backup.balance = result.balance
+        backup.isLowBalance = result.isLowBalance
+        backup.isTokenExpired = result.isTokenExpired // 更新 token 過期狀態
+        backup.cachedAt = result.cachedAt // 更新緩存時間
+      }
+      // 如果是當前帳號，也更新 currentUsageInfo 並同步倒計時
+      if (backup?.isCurrent) {
+        currentUsageInfo.value = {
+          subscriptionTitle: result.subscriptionTitle,
+          usageLimit: result.usageLimit,
+          currentUsage: result.currentUsage,
+          balance: result.balance,
+          isLowBalance: result.isLowBalance
+        }
+        // 同時啟動當前帳號的倒計時
+        startCurrentCountdown()
+      }
+      // 啟動備份的倒計時
+      startCountdown(name)
+    } else {
+      showToast(result.message, 'error')
+    }
+  } catch (e) {
+    showToast(t('message.refreshFailed'), 'error')
+  } finally {
+    refreshingBackup.value = null
+  }
+}
+
+const refreshCurrentUsage = async () => {
+  // 找到當前帳號對應的備份
+  const currentBackup = backups.value.find(b => b.isCurrent)
+  
+  // 檢查冷卻期（當前帳號或對應備份任一在冷卻中都不允許刷新）
+  if (isCurrentInCooldown() || (currentBackup && isInCooldown(currentBackup.name))) {
+    return
+  }
+
+  if (currentBackup) {
+    // 使用現有的 refreshBackupUsage 函數
+    refreshingCurrent.value = true
+    try {
+      const result = await window.go.main.App.RefreshBackupUsage(currentBackup.name)
+      if (result.success) {
+        currentBackup.subscriptionTitle = result.subscriptionTitle
+        currentBackup.usageLimit = result.usageLimit
+        currentBackup.currentUsage = result.currentUsage
+        currentBackup.balance = result.balance
+        currentBackup.isLowBalance = result.isLowBalance
+        currentBackup.isTokenExpired = result.isTokenExpired // 更新 token 過期狀態
+        currentBackup.cachedAt = result.cachedAt // 更新緩存時間
+        currentUsageInfo.value = {
+          subscriptionTitle: result.subscriptionTitle,
+          usageLimit: result.usageLimit,
+          currentUsage: result.currentUsage,
+          balance: result.balance,
+          isLowBalance: result.isLowBalance
+        }
+        // 同時啟動當前帳號和對應備份的倒計時
+        startCurrentCountdown()
+        startCountdown(currentBackup.name)
+      } else {
+        showToast(result.message, 'error')
+      }
+    } catch (e) {
+      showToast(t('message.refreshFailed'), 'error')
+    } finally {
+      refreshingCurrent.value = false
+    }
+  }
+}
+
+const openExtensionFolder = async () => {
+  try {
+    const result = await window.go.main.App.OpenExtensionFolder()
+    if (!result.success) {
+      showToast(result.message, 'error')
+    }
+  } catch (e) {
+    console.error('Failed to open extension folder:', e)
+  }
+}
+
+const openMachineIDFolder = async () => {
+  try {
+    const result = await window.go.main.App.OpenMachineIDFolder()
+    if (!result.success) {
+      showToast(result.message, 'error')
+    }
+  } catch (e) {
+    console.error('Failed to open machine ID folder:', e)
+  }
+}
+
+const openSSOCacheFolder = async () => {
+  try {
+    const result = await window.go.main.App.OpenSSOCacheFolder()
+    if (!result.success) {
+      showToast(result.message, 'error')
+    }
+  } catch (e) {
+    console.error('Failed to open SSO cache folder:', e)
+  }
+}
+
+const patchExtension = async () => {
+  patching.value = true
+  try {
+    const result = await window.go.main.App.RepatchExtension()
+    if (result.success) {
+      showToast(result.message, 'success')
+      // 更新軟重置狀態
+      softResetStatus.value = await window.go.main.App.GetSoftResetStatus()
+    } else {
+      showToast(result.message, 'error')
+    }
+  } catch (e) {
+    console.error('Failed to patch extension:', e)
+    showToast(t('message.error'), 'error')
+  } finally {
+    patching.value = false
+  }
+}
+
 onMounted(() => {
   // 語言已在 i18n/index.ts 中根據系統語言初始化
   // 這裡只需同步 locale 到當前組件（如果 localStorage 有值）
@@ -258,11 +712,9 @@ onMounted(() => {
     locale.value = savedLang
   }
   
-  // 載入一鍵新機模式設定
-  const savedResetMode = localStorage.getItem('kiro-manager-reset-mode')
-  if (savedResetMode && ['soft', 'hard'].includes(savedResetMode)) {
-    resetMode.value = savedResetMode as 'soft' | 'hard'
-  }
+  // 載入一鍵新機模式設定（硬一鍵新機暫時停用，強制使用軟一鍵新機）
+  resetMode.value = 'soft'
+  localStorage.setItem('kiro-manager-reset-mode', 'soft')
   
   // 載入是否已使用過一鍵新機
   hasUsedReset.value = localStorage.getItem('kiro-manager-has-used-reset') === 'true'
@@ -278,7 +730,7 @@ onMounted(() => {
   <div class="flex h-screen bg-app-bg font-sans text-sm text-zinc-300">
     
     <!-- 左側邊欄 -->
-    <aside class="w-64 flex-shrink-0 border-r border-app-border flex flex-col bg-[#0c0c0e]">
+    <aside class="w-[220px] flex-shrink-0 border-r border-app-border flex flex-col bg-[#0c0c0e]">
       <div class="h-16 flex items-center px-6 border-b border-app-border">
         <!-- Kiro Logo SVG -->
         <svg width="28" height="28" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" class="mr-3 flex-shrink-0">
@@ -329,7 +781,7 @@ onMounted(() => {
               : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900'
           ]"
         >
-          <Icon name="Layers" :class="['w-4 h-4 mr-3', activeMenu === 'dashboard' ? 'text-app-accent' : '']" />
+          <Icon name="Home" :class="['w-4 h-4 mr-3', activeMenu === 'dashboard' ? 'text-app-accent' : '']" />
           {{ t('menu.dashboard') }}
         </div>
         <div 
@@ -341,7 +793,7 @@ onMounted(() => {
               : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900'
           ]"
         >
-          <Icon name="Cpu" :class="['w-4 h-4 mr-3', activeMenu === 'settings' ? 'text-app-accent' : '']" />
+          <Icon name="Settings" :class="['w-4 h-4 mr-3', activeMenu === 'settings' ? 'text-app-accent' : '']" />
           {{ t('menu.settings') }}
         </div>
       </nav>
@@ -366,13 +818,75 @@ onMounted(() => {
       <div class="flex-1 overflow-y-auto p-8 space-y-8">
         
         <!-- 設定面板 -->
-        <div v-if="showSettingsPanel" class="max-w-2xl">
-            <h3 class="text-white font-semibold text-xl mb-6">{{ t('settings.title') }}</h3>
+        <div v-if="showSettingsPanel" class="space-y-6">
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <!-- 左欄：一鍵新機模式設定 -->
+          <div class="bg-zinc-900 border border-app-border rounded-xl p-6 flex flex-col">
+            <h4 class="text-zinc-300 font-medium mb-4 flex items-center">
+              <Icon name="Sparkles" class="w-5 h-5 mr-2 text-zinc-400" />
+              {{ t('settings.resetMode') }}
+            </h4>
             
+            <div class="space-y-3 flex-1 flex flex-col justify-center">
+              <!-- 軟一鍵新機選項 -->
+              <label 
+                @click="setResetMode('soft')"
+                :class="[
+                  'flex items-start p-4 rounded-lg border cursor-pointer transition-all',
+                  resetMode === 'soft' 
+                    ? 'bg-zinc-800 border-zinc-600' 
+                    : 'border-zinc-700 hover:border-zinc-600'
+                ]"
+              >
+                <div :class="[
+                  'w-5 h-5 rounded-full border-2 flex items-center justify-center mr-4 mt-0.5 flex-shrink-0',
+                  resetMode === 'soft' ? 'border-zinc-400' : 'border-zinc-500'
+                ]">
+                  <div v-if="resetMode === 'soft'" class="w-2.5 h-2.5 rounded-full bg-zinc-400"></div>
+                </div>
+                <div class="flex-1">
+                  <div class="flex items-center gap-2 mb-1">
+                    <span :class="['font-medium', resetMode === 'soft' ? 'text-zinc-200' : 'text-zinc-300']">
+                      {{ t('settings.softReset') }}
+                    </span>
+                    <span class="px-1.5 py-0.5 rounded text-[10px] bg-app-success/20 text-app-success border border-app-success/30">
+                      {{ t('settings.recommended') }}
+                    </span>
+                  </div>
+                  <p class="text-zinc-500 text-sm">{{ t('settings.softResetDesc') }}</p>
+                </div>
+              </label>
+              
+              <!-- 硬一鍵新機選項（暫時停用） -->
+              <div 
+                :class="[
+                  'flex items-start p-4 rounded-lg border transition-all opacity-50 cursor-not-allowed',
+                  'border-zinc-700/50 bg-zinc-900/50'
+                ]"
+              >
+                <div class="w-5 h-5 rounded-full border-2 flex items-center justify-center mr-4 mt-0.5 flex-shrink-0 border-zinc-600">
+                </div>
+                <div class="flex-1">
+                  <div class="flex items-center gap-2 mb-1">
+                    <span class="font-medium text-zinc-500">
+                      {{ t('settings.hardReset') }}
+                    </span>
+                    <span class="px-1.5 py-0.5 rounded text-[10px] bg-zinc-700/50 text-zinc-500 border border-zinc-600/30">
+                      {{ t('settings.hardResetDisabled') }}
+                    </span>
+                  </div>
+                  <p class="text-zinc-600 text-sm">{{ t('settings.hardResetDisabledReason') }}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+          
+          <!-- 右欄：介面語言 + 低餘額設置 -->
+          <div class="space-y-6">
             <!-- 語言設定 -->
-            <div class="bg-zinc-900 border border-app-border rounded-xl p-6 mb-6">
+            <div class="bg-zinc-900 border border-app-border rounded-xl p-6">
               <h4 class="text-zinc-300 font-medium mb-4 flex items-center">
-                <Icon name="Layers" class="w-5 h-5 mr-2 text-zinc-400" />
+                <Icon name="Globe" class="w-5 h-5 mr-2 text-zinc-400" />
                 {{ t('settings.language') }}
               </h4>
               
@@ -393,73 +907,83 @@ onMounted(() => {
               </div>
             </div>
             
-            <!-- 一鍵新機模式設定 -->
+            <!-- 低餘額閾值設定 -->
             <div class="bg-zinc-900 border border-app-border rounded-xl p-6">
               <h4 class="text-zinc-300 font-medium mb-4 flex items-center">
-                <Icon name="Sparkles" class="w-5 h-5 mr-2 text-zinc-400" />
-                {{ t('settings.resetMode') }}
+                <Icon name="AlertTriangle" class="w-5 h-5 mr-2 text-zinc-400" />
+                {{ t('settings.lowBalanceThreshold') }}
               </h4>
               
-              <div class="space-y-3">
-                <!-- 軟一鍵新機選項 -->
-                <label 
-                  @click="setResetMode('soft')"
-                  :class="[
-                    'flex items-start p-4 rounded-lg border cursor-pointer transition-all',
-                    resetMode === 'soft' 
-                      ? 'bg-zinc-800 border-zinc-600' 
-                      : 'border-zinc-700 hover:border-zinc-600'
-                  ]"
-                >
-                  <div :class="[
-                    'w-5 h-5 rounded-full border-2 flex items-center justify-center mr-4 mt-0.5 flex-shrink-0',
-                    resetMode === 'soft' ? 'border-zinc-400' : 'border-zinc-500'
-                  ]">
-                    <div v-if="resetMode === 'soft'" class="w-2.5 h-2.5 rounded-full bg-zinc-400"></div>
-                  </div>
-                  <div class="flex-1">
-                    <div class="flex items-center gap-2 mb-1">
-                      <span :class="['font-medium', resetMode === 'soft' ? 'text-zinc-200' : 'text-zinc-300']">
-                        {{ t('settings.softReset') }}
-                      </span>
-                      <span class="px-1.5 py-0.5 rounded text-[10px] bg-app-success/20 text-app-success border border-app-success/30">
-                        {{ t('settings.recommended') }}
-                      </span>
-                    </div>
-                    <p class="text-zinc-500 text-sm">{{ t('settings.softResetDesc') }}</p>
-                  </div>
-                </label>
-                
-                <!-- 硬一鍵新機選項 -->
-                <label 
-                  @click="setResetMode('hard')"
-                  :class="[
-                    'flex items-start p-4 rounded-lg border cursor-pointer transition-all',
-                    resetMode === 'hard' 
-                      ? 'bg-zinc-800 border-zinc-600' 
-                      : 'border-zinc-700 hover:border-zinc-600'
-                  ]"
-                >
-                  <div :class="[
-                    'w-5 h-5 rounded-full border-2 flex items-center justify-center mr-4 mt-0.5 flex-shrink-0',
-                    resetMode === 'hard' ? 'border-zinc-400' : 'border-zinc-500'
-                  ]">
-                    <div v-if="resetMode === 'hard'" class="w-2.5 h-2.5 rounded-full bg-zinc-400"></div>
-                  </div>
-                  <div class="flex-1">
-                    <div class="flex items-center gap-2 mb-1">
-                      <span :class="['font-medium', resetMode === 'hard' ? 'text-zinc-200' : 'text-zinc-300']">
-                        {{ t('settings.hardReset') }}
-                      </span>
-                      <span class="px-1.5 py-0.5 rounded text-[10px] bg-app-warning/20 text-app-warning border border-app-warning/30">
-                        {{ t('settings.windowsOnly') }}
-                      </span>
-                    </div>
-                    <p class="text-zinc-500 text-sm">{{ t('settings.hardResetDesc') }}</p>
-                  </div>
-                </label>
+              <p class="text-zinc-500 text-sm mb-4">{{ t('settings.lowBalanceThresholdDesc') }}</p>
+              
+              <div class="flex items-center gap-4">
+                <input 
+                  type="range" 
+                  min="0" 
+                  max="100" 
+                  step="5"
+                  :value="thresholdPreview"
+                  @input="(e) => thresholdPreview = Number((e.target as HTMLInputElement).value)"
+                  @change="(e) => saveLowBalanceThreshold(Number((e.target as HTMLInputElement).value) / 100)"
+                  class="flex-1 h-2 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-app-accent"
+                />
+                <span class="text-zinc-200 font-mono text-sm w-12 text-right">
+                  {{ thresholdPreview }}%
+                </span>
+              </div>
+              
+              <div class="flex justify-between text-xs text-zinc-500 mt-2">
+                <span>0%</span>
+                <span>50%</span>
+                <span>100%</span>
               </div>
             </div>
+            
+          </div>
+          </div>
+          
+          <!-- Kiro 版本號設定（獨佔一行） -->
+          <div class="bg-zinc-900 border border-app-border rounded-xl p-6">
+            <h4 class="text-zinc-300 font-medium mb-4 flex items-center">
+              <Icon name="Tag" class="w-5 h-5 mr-2 text-zinc-400" />
+              {{ t('settings.kiroVersion') }}
+              <!-- 自動偵測狀態指示 -->
+              <span 
+                v-if="appSettings.useAutoDetect" 
+                class="ml-3 px-2 py-0.5 rounded text-[10px] bg-app-success/20 text-app-success border border-app-success/30"
+              >
+                {{ t('settings.autoDetectActive') }}
+              </span>
+            </h4>
+            
+            <p class="text-zinc-500 text-sm mb-4">{{ t('settings.kiroVersionDesc') }}</p>
+            
+            <div class="flex items-center gap-3 max-w-md">
+              <input 
+                v-model="kiroVersionInput"
+                @input="onKiroVersionInput"
+                type="text"
+                :placeholder="t('settings.kiroVersionPlaceholder')"
+                class="flex-1 px-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-zinc-200 text-sm font-mono focus:outline-none focus:border-app-accent transition-colors"
+              />
+              <button 
+                @click="detectKiroVersion"
+                :disabled="detectingVersion || appSettings.useAutoDetect"
+                class="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 disabled:cursor-not-allowed text-zinc-200 rounded-lg text-sm transition-colors flex items-center gap-2"
+              >
+                <Icon v-if="detectingVersion" name="RefreshCw" class="w-4 h-4 animate-spin" />
+                <Icon v-else name="Search" class="w-4 h-4" />
+                {{ t('settings.detectVersion') }}
+              </button>
+              <button 
+                @click="saveKiroVersion"
+                :disabled="!kiroVersionModified"
+                class="px-4 py-2 bg-app-accent hover:bg-app-accent/80 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm transition-colors"
+              >
+                {{ t('backup.confirm') }}
+              </button>
+            </div>
+          </div>
         </div>
         
         <!-- Dashboard 內容 -->
@@ -470,8 +994,26 @@ onMounted(() => {
           
           <!-- 當前狀態卡片 -->
           <div class="lg:col-span-3 bg-gradient-to-br from-zinc-900 to-zinc-900/50 border border-app-border rounded-xl p-6 relative overflow-hidden group">
-            <div class="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-              <Icon name="Cpu" class="w-32 h-32 text-white" />
+            <!-- 背景圖標：根據 Provider 動態顯示，點擊打開 SSO Cache 文件夾 -->
+            <div 
+              @click="openSSOCacheFolder"
+              class="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 hover:!opacity-40 transition-opacity cursor-pointer z-20"
+              :title="t('status.openSSOCache')"
+            >
+              <!-- 有 activeBackup 時顯示備份的 provider 圖標 -->
+              <template v-if="activeBackup">
+                <Icon v-if="activeBackup.provider === 'Github'" name="Github" class="w-32 h-32 text-white pointer-events-none" />
+                <Icon v-else-if="activeBackup.provider === 'AWS' || activeBackup.provider === 'BuilderId'" name="AWS" class="w-32 h-32 text-white pointer-events-none" />
+                <Icon v-else-if="activeBackup.provider === 'Google'" name="Google" class="w-32 h-32 text-white pointer-events-none" />
+                <Icon v-else name="Cpu" class="w-32 h-32 text-white pointer-events-none" />
+              </template>
+              <!-- 沒有 activeBackup（原始機器）時顯示當前登入的 provider 圖標 -->
+              <template v-else>
+                <Icon v-if="currentProvider === 'Github'" name="Github" class="w-32 h-32 text-white pointer-events-none" />
+                <Icon v-else-if="currentProvider === 'AWS' || currentProvider === 'BuilderId'" name="AWS" class="w-32 h-32 text-white pointer-events-none" />
+                <Icon v-else-if="currentProvider === 'Google'" name="Google" class="w-32 h-32 text-white pointer-events-none" />
+                <Icon v-else name="Cpu" class="w-32 h-32 text-white pointer-events-none" />
+              </template>
             </div>
             
             <div class="relative z-10">
@@ -479,12 +1021,63 @@ onMounted(() => {
                 <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-app-warning text-black uppercase tracking-wider">
                   {{ t('status.current') }}
                 </span>
-                <span v-if="activeBackup?.backupTime" class="text-zinc-500 text-xs font-mono">
-                  {{ activeBackup.backupTime }}
-                </span>
+                <!-- 顯示當前帳號訂閱和餘額 -->
+                <template v-if="currentUsageInfo">
+                  <span class="px-2 py-0.5 rounded text-[10px] bg-app-accent/20 text-app-accent border border-app-accent/30 font-medium">
+                    {{ currentUsageInfo.subscriptionTitle }}
+                  </span>
+                  <span 
+                    :class="[
+                      'text-xs font-mono',
+                      currentUsageInfo.isLowBalance ? 'text-app-warning' : 'text-zinc-400'
+                    ]"
+                  >
+                    <span v-if="currentUsageInfo.isLowBalance" class="inline-flex items-center gap-1">
+                      <Icon name="AlertTriangle" class="w-3 h-3" />
+                      {{ Math.round(currentUsageInfo.balance) }} / {{ Math.round(currentUsageInfo.usageLimit) }}
+                    </span>
+                    <span v-else>
+                      {{ Math.round(currentUsageInfo.balance) }} / {{ Math.round(currentUsageInfo.usageLimit) }}
+                    </span>
+                  </span>
+                  <!-- 刷新按鈕 / 倒計時 -->
+                  <button
+                    @click="refreshCurrentUsage"
+                    :disabled="refreshingCurrent || isCurrentInCooldown()"
+                    :class="[
+                      'w-[22px] h-[22px] rounded transition-all inline-flex items-center justify-center',
+                      refreshingCurrent
+                        ? 'text-app-accent cursor-wait'
+                        : isCurrentInCooldown()
+                          ? 'text-zinc-500 cursor-not-allowed'
+                          : backups.find(b => b.isCurrent)?.isTokenExpired
+                            ? 'text-app-warning hover:text-amber-400'
+                            : 'text-zinc-500 hover:text-zinc-300'
+                    ]"
+                    :title="backups.find(b => b.isCurrent)?.isTokenExpired
+                      ? t('message.tokenExpiredTip')
+                      : t('backup.refresh')"
+                  >
+                    <!-- 倒計時數字 -->
+                    <span 
+                      v-if="isCurrentInCooldown() && !refreshingCurrent" 
+                      class="text-xs font-mono font-medium leading-none"
+                    >
+                      {{ countdownCurrentAccount }}
+                    </span>
+                    <!-- 刷新圖標 -->
+                    <Icon 
+                      v-else
+                      name="RefreshCw" 
+                      :class="['w-3.5 h-3.5', refreshingCurrent ? 'animate-spin' : '']" 
+                    />
+                  </button>
+                </template>
               </div>
               
-              <h3 class="text-3xl font-bold text-white mb-1 glow-text">{{ activeBackup?.name || t('status.originalMachine') }}</h3>
+              <h3 class="text-3xl font-bold text-white mb-1 glow-text">
+                {{ activeBackup?.name || t('status.originalMachine') }}
+              </h3>
               <div class="flex items-center gap-2 text-app-accent font-mono text-sm mb-6">
                 <Icon name="Check" class="w-4 h-4" />
                 {{ currentMachineId || '-' }}
@@ -521,27 +1114,64 @@ onMounted(() => {
               <!-- Patch 狀態 -->
               <div class="flex items-center justify-between">
                 <span class="text-zinc-500 text-sm">Extension Patch</span>
-                <span :class="[
-                  'px-2 py-0.5 rounded text-xs font-medium',
-                  softResetStatus.isPatched 
-                    ? 'bg-app-success/20 text-app-success border border-app-success/30' 
-                    : 'bg-zinc-700/50 text-zinc-400 border border-zinc-600/30'
-                ]">
-                  {{ softResetStatus.isPatched ? t('status.patched') : t('status.notPatched') }}
-                </span>
+                <div class="flex items-center gap-2">
+                  <!-- 已 Patch：顯示靜態標籤 -->
+                  <span 
+                    v-if="softResetStatus.isPatched"
+                    class="px-2 py-0.5 rounded text-xs font-medium bg-app-success/20 text-app-success border border-app-success/30"
+                  >
+                    {{ t('status.patched') }}
+                  </span>
+                  <!-- 未 Patch：顯示可點擊按鍵 -->
+                  <button
+                    v-else
+                    @click="patchExtension"
+                    :disabled="patching"
+                    :class="[
+                      'px-2 py-0.5 rounded text-xs font-medium transition-all',
+                      patching
+                        ? 'bg-zinc-700/50 text-zinc-500 border border-zinc-600/30 cursor-wait'
+                        : 'bg-app-warning/20 text-app-warning border border-app-warning/30 hover:bg-app-warning/30 cursor-pointer'
+                    ]"
+                    :title="t('status.clickToPatch')"
+                  >
+                    <span v-if="patching" class="flex items-center gap-1">
+                      <Icon name="Loader" class="w-3 h-3 animate-spin" />
+                      {{ t('status.patching') }}
+                    </span>
+                    <span v-else>{{ t('status.notPatched') }}</span>
+                  </button>
+                  <button
+                    v-if="softResetStatus.extensionPath"
+                    @click="openExtensionFolder"
+                    class="p-1 rounded text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700/50 transition-colors"
+                    :title="t('status.openFolder')"
+                  >
+                    <Icon name="FolderOpen" class="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
               
               <!-- 自訂 ID 狀態 -->
               <div class="flex items-center justify-between">
                 <span class="text-zinc-500 text-sm">Machine ID</span>
-                <span :class="[
-                  'px-2 py-0.5 rounded text-xs font-medium',
-                  softResetStatus.hasCustomId 
-                    ? 'bg-app-accent/20 text-app-accent border border-app-accent/30' 
-                    : 'bg-zinc-700/50 text-zinc-400 border border-zinc-600/30'
-                ]">
-                  {{ softResetStatus.hasCustomId ? t('status.hasCustomId') : t('status.noCustomId') }}
-                </span>
+                <div class="flex items-center gap-2">
+                  <span :class="[
+                    'px-2 py-0.5 rounded text-xs font-medium',
+                    softResetStatus.hasCustomId 
+                      ? 'bg-app-accent/20 text-app-accent border border-app-accent/30' 
+                      : 'bg-zinc-700/50 text-zinc-400 border border-zinc-600/30'
+                  ]">
+                    {{ softResetStatus.hasCustomId ? t('status.hasCustomId') : t('status.noCustomId') }}
+                  </span>
+                  <button
+                    @click="openMachineIDFolder"
+                    class="p-1 rounded text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700/50 transition-colors"
+                    :title="t('status.openFolder')"
+                  >
+                    <Icon name="FolderOpen" class="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
               
               <!-- 總體狀態指示 -->
@@ -610,7 +1240,7 @@ onMounted(() => {
         <div>
           <div class="flex items-center justify-between mb-4">
             <h3 class="text-zinc-400 text-sm font-semibold flex items-center">
-              <Icon name="Layers" class="w-4 h-4 mr-2" />
+              <Icon name="Database" class="w-4 h-4 mr-2" />
               {{ t('backup.list') }}
             </h3>
             <div class="relative">
@@ -629,13 +1259,15 @@ onMounted(() => {
                 <tr class="border-b border-zinc-800 bg-zinc-900/50 text-zinc-500 text-xs uppercase tracking-wider">
                   <th class="px-6 py-4 font-medium">{{ t('backup.name') }}</th>
                   <th class="px-6 py-4 font-medium">{{ t('backup.provider') }}</th>
+                  <th class="px-6 py-4 font-medium">{{ t('backup.subscription') }}</th>
+                  <th class="px-6 py-4 font-medium">{{ t('backup.balance') }}</th>
                   <th class="px-6 py-4 font-medium">{{ t('backup.machineId') }}</th>
                   <th class="px-6 py-4 font-medium text-right">{{ t('backup.actions') }}</th>
                 </tr>
               </thead>
               <tbody class="divide-y divide-zinc-800/50">
                 <tr v-if="filteredBackups.length === 0">
-                  <td colspan="4" class="px-6 py-12 text-center text-zinc-500">{{ t('backup.noBackups') }}</td>
+                  <td colspan="6" class="px-6 py-12 text-center text-zinc-500">{{ t('backup.noBackups') }}</td>
                 </tr>
                 <tr 
                   v-for="backup in filteredBackups" 
@@ -654,12 +1286,99 @@ onMounted(() => {
                     </div>
                   </td>
                   <td class="px-6 py-4">
-                    <span class="px-2 py-1 rounded text-[10px] bg-zinc-800 text-zinc-400 border border-zinc-700">
+                    <span class="px-2 py-1 rounded text-[10px] bg-zinc-800 text-zinc-400 border border-zinc-700 inline-flex items-center gap-1.5">
+                      <Icon v-if="backup.provider === 'Github'" name="Github" class="w-3.5 h-3.5" />
+                      <Icon v-else-if="backup.provider === 'AWS' || backup.provider === 'BuilderId'" name="AWS" class="w-3.5 h-3.5" />
+                      <Icon v-else-if="backup.provider === 'Google'" name="Google" class="w-3.5 h-3.5" />
                       {{ backup.provider || '-' }}
                     </span>
                   </td>
-                  <td class="px-6 py-4 font-mono text-xs text-zinc-500">
-                    {{ backup.machineId || '-' }}
+                  <!-- 訂閱類型 (Requirements: 3.3) -->
+                  <td class="px-6 py-4">
+                    <span 
+                      v-if="backup.subscriptionTitle"
+                      class="px-2 py-1 rounded text-[10px] bg-app-accent/20 text-app-accent border border-app-accent/30 font-medium"
+                    >
+                      {{ backup.subscriptionTitle }}
+                    </span>
+                    <span v-else class="text-zinc-500">-</span>
+                  </td>
+                  <!-- 餘額 (Requirements: 3.1, 3.2) -->
+                  <td class="px-6 py-4">
+                    <div class="flex items-center gap-2">
+                      <span 
+                        v-if="backup.usageLimit > 0"
+                        :class="[
+                          'font-mono text-xs',
+                          backup.isLowBalance 
+                            ? 'text-app-warning' 
+                            : 'text-zinc-400'
+                        ]"
+                      >
+                        <span v-if="backup.isLowBalance" class="inline-flex items-center gap-1">
+                          <Icon name="AlertTriangle" class="w-3 h-3" />
+                          {{ Math.round(backup.balance) }} / {{ Math.round(backup.usageLimit) }}
+                        </span>
+                        <span v-else>
+                          {{ Math.round(backup.balance) }} / {{ Math.round(backup.usageLimit) }}
+                        </span>
+                      </span>
+                      <span v-else class="text-zinc-500">-</span>
+                      <!-- 刷新按鈕 / 倒計時 -->
+                      <template v-if="backup.hasToken">
+                        <button
+                          @click="refreshBackupUsage(backup.name)"
+                          :disabled="refreshingBackup === backup.name || isInCooldown(backup.name)"
+                          :class="[
+                            'w-[26px] h-[26px] rounded transition-all inline-flex items-center justify-center',
+                            refreshingBackup === backup.name
+                              ? 'text-app-accent cursor-wait'
+                              : isInCooldown(backup.name)
+                                ? 'text-zinc-500 cursor-not-allowed'
+                                : backup.isTokenExpired
+                                  ? 'text-app-warning hover:text-amber-400 hover:bg-zinc-700/50'
+                                  : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700/50'
+                          ]"
+                          :title="backup.isTokenExpired
+                            ? t('message.tokenExpiredTip')
+                            : t('backup.refresh')"
+                        >
+                          <!-- 倒計時數字 -->
+                          <span 
+                            v-if="isInCooldown(backup.name) && refreshingBackup !== backup.name" 
+                            class="text-xs font-mono font-medium leading-none"
+                          >
+                            {{ countdownTimers[backup.name] }}
+                          </span>
+                          <!-- 刷新圖標 -->
+                          <Icon 
+                            v-else
+                            name="RefreshCw" 
+                            :class="['w-3.5 h-3.5', refreshingBackup === backup.name ? 'animate-spin' : '']" 
+                          />
+                        </button>
+                      </template>
+                    </div>
+                  </td>
+                  <td class="px-6 py-4">
+                    <button
+                      v-if="backup.machineId"
+                      @click="copyMachineId(backup.machineId)"
+                      class="font-mono text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer transition-colors inline-flex items-center gap-1.5 group"
+                      :title="backup.machineId"
+                    >
+                      <span>{{ truncateMachineId(backup.machineId) }}</span>
+                      <Icon 
+                        :name="copiedMachineId === backup.machineId ? 'Check' : 'Copy'" 
+                        :class="[
+                          'w-3 h-3 transition-all',
+                          copiedMachineId === backup.machineId 
+                            ? 'text-app-success' 
+                            : 'opacity-0 group-hover:opacity-100 text-zinc-400'
+                        ]" 
+                      />
+                    </button>
+                    <span v-else class="font-mono text-xs text-zinc-500">-</span>
                   </td>
                   <td class="px-6 py-4 text-right">
                     <div v-if="backup.isCurrent" class="text-app-warning text-xs font-bold flex items-center justify-end gap-1">
@@ -762,6 +1481,51 @@ onMounted(() => {
             class="px-4 py-2 bg-app-accent hover:bg-app-accent/80 text-white rounded-lg text-sm transition-colors"
           >
             {{ t('message.continueReset') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Confirm Dialog -->
+    <div v-if="confirmDialog.show" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50" @click.self="confirmDialog.onCancel">
+      <div class="bg-app-surface border border-app-border rounded-xl p-6 max-w-md shadow-2xl">
+        <div class="flex items-center gap-3 mb-4">
+          <div :class="[
+            'w-10 h-10 rounded-full flex items-center justify-center',
+            confirmDialog.type === 'danger' ? 'bg-app-danger/20' : confirmDialog.type === 'info' ? 'bg-app-accent/20' : 'bg-app-warning/20'
+          ]">
+            <Icon 
+              :name="confirmDialog.type === 'danger' ? 'Trash' : confirmDialog.type === 'info' ? 'Info' : 'AlertTriangle'" 
+              :class="[
+                'w-5 h-5',
+                confirmDialog.type === 'danger' ? 'text-app-danger' : confirmDialog.type === 'info' ? 'text-app-accent' : 'text-app-warning'
+              ]" 
+            />
+          </div>
+          <h3 class="text-white font-semibold text-lg">{{ confirmDialog.title }}</h3>
+        </div>
+        
+        <p class="text-zinc-300 text-sm leading-relaxed mb-6">
+          {{ confirmDialog.message }}
+        </p>
+        
+        <div class="flex justify-end gap-3">
+          <button 
+            @click="confirmDialog.onCancel"
+            class="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg text-sm transition-colors"
+          >
+            {{ confirmDialog.cancelText }}
+          </button>
+          <button 
+            @click="confirmDialog.onConfirm"
+            :class="[
+              'px-4 py-2 rounded-lg text-sm transition-colors',
+              confirmDialog.type === 'danger' 
+                ? 'bg-app-danger hover:bg-app-danger/80 text-white' 
+                : 'bg-app-accent hover:bg-app-accent/80 text-white'
+            ]"
+          >
+            {{ confirmDialog.confirmText }}
           </button>
         </div>
       </div>

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const (
@@ -26,6 +27,8 @@ type KiroAuthToken struct {
 	TokenType    string `json:"tokenType,omitempty"`
 	Region       string `json:"region,omitempty"`
 	StartURL     string `json:"startUrl,omitempty"`
+	ProfileArn   string `json:"profileArn,omitempty"`
+	ClientIdHash string `json:"clientIdHash,omitempty"` // BuilderId (IdC) 用於關聯 clientId/clientSecret 文件
 }
 
 // SSOCacheFile 代表通用的 SSO 快取檔案結構
@@ -165,4 +168,24 @@ func ReadCacheFileRaw(filename string) (map[string]interface{}, error) {
 	}
 
 	return raw, nil
+}
+
+
+// IsTokenExpired 檢查 token 是否已過期
+func IsTokenExpired(token *KiroAuthToken) bool {
+	if token == nil || token.ExpiresAt == "" {
+		return true
+	}
+
+	// 解析 ISO 8601 格式的時間字串
+	expiresAt, err := time.Parse(time.RFC3339, token.ExpiresAt)
+	if err != nil {
+		// 嘗試其他可能的格式
+		expiresAt, err = time.Parse("2006-01-02T15:04:05.000Z", token.ExpiresAt)
+		if err != nil {
+			return true
+		}
+	}
+
+	return time.Now().After(expiresAt)
 }

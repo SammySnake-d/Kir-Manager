@@ -17,9 +17,9 @@ func main() {
 
 	err := wails.Run(&options.App{
 		Title:     "Kiro Manager",
-		Width:     1100,
+		Width:     1230,
 		Height:    680,
-		MinWidth:  1100,
+		MinWidth:  1230,
 		MinHeight: 600,
 		AssetServer: &assetserver.Options{
 			Assets: assets,

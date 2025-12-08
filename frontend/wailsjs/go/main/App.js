@@ -26,8 +26,24 @@ export function GetCurrentMachineID() {
   return window['go']['main']['App']['GetCurrentMachineID']();
 }
 
+export function GetCurrentProvider() {
+  return window['go']['main']['App']['GetCurrentProvider']();
+}
+
+export function GetCurrentUsageInfo() {
+  return window['go']['main']['App']['GetCurrentUsageInfo']();
+}
+
+export function GetDetectedKiroVersion() {
+  return window['go']['main']['App']['GetDetectedKiroVersion']();
+}
+
 export function GetKiroProcesses() {
   return window['go']['main']['App']['GetKiroProcesses']();
+}
+
+export function GetSettings() {
+  return window['go']['main']['App']['GetSettings']();
 }
 
 export function GetSoftResetStatus() {
@@ -36,6 +52,22 @@ export function GetSoftResetStatus() {
 
 export function IsKiroRunning() {
   return window['go']['main']['App']['IsKiroRunning']();
+}
+
+export function OpenExtensionFolder() {
+  return window['go']['main']['App']['OpenExtensionFolder']();
+}
+
+export function OpenMachineIDFolder() {
+  return window['go']['main']['App']['OpenMachineIDFolder']();
+}
+
+export function OpenSSOCacheFolder() {
+  return window['go']['main']['App']['OpenSSOCacheFolder']();
+}
+
+export function RefreshBackupUsage(arg1) {
+  return window['go']['main']['App']['RefreshBackupUsage'](arg1);
 }
 
 export function RepatchExtension() {
@@ -52,6 +84,10 @@ export function RestoreOriginal() {
 
 export function RestoreSoftReset() {
   return window['go']['main']['App']['RestoreSoftReset']();
+}
+
+export function SaveSettings(arg1) {
+  return window['go']['main']['App']['SaveSettings'](arg1);
 }
 
 export function SoftResetToNewMachine() {

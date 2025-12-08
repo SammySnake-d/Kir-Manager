@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"kiro-manager/awssso"
@@ -17,6 +18,7 @@ const (
 	BackupDirName       = "backups"
 	MachineIDFileName   = "machine-id.json"
 	KiroAuthTokenFile   = "kiro-auth-token.json"
+	UsageCacheFileName  = "usage-cache.json"
 )
 
 var (
@@ -39,6 +41,16 @@ type BackupInfo struct {
 	BackupTime time.Time `json:"backupTime"`
 	HasToken   bool      `json:"hasToken"`
 	HasMachineID bool    `json:"hasMachineId"`
+}
+
+// UsageCache 餘額緩存結構
+type UsageCache struct {
+	SubscriptionTitle string    `json:"subscriptionTitle"`
+	UsageLimit        float64   `json:"usageLimit"`
+	CurrentUsage      float64   `json:"currentUsage"`
+	Balance           float64   `json:"balance"`
+	IsLowBalance      bool      `json:"isLowBalance"`
+	CachedAt          time.Time `json:"cachedAt"`
 }
 
 // GetBackupRootPath 取得備份根目錄（執行檔同層的 backups 資料夾）
@@ -184,6 +196,26 @@ func CreateBackup(name string) error {
 		return fmt.Errorf("failed to backup token: %w", err)
 	}
 
+	// 讀取 token 以檢查是否需要備份 IdC 的 clientIdHash 文件
+	token, err := awssso.ReadKiroAuthToken()
+	if err == nil && token != nil {
+		// 如果是 IdC 認證且有 clientIdHash，備份對應的 clientId/clientSecret 文件
+		if isIdCAuth(token.AuthMethod) && token.ClientIdHash != "" {
+			clientIdHashFile := token.ClientIdHash + ".json"
+			ssoCachePath, err := awssso.GetSSOCachePath()
+			if err == nil {
+				clientIdHashSrcPath := filepath.Join(ssoCachePath, clientIdHashFile)
+				if _, err := os.Stat(clientIdHashSrcPath); err == nil {
+					clientIdHashDstPath := filepath.Join(backupPath, clientIdHashFile)
+					if err := copyFile(clientIdHashSrcPath, clientIdHashDstPath); err != nil {
+						// 備份 clientIdHash 文件失敗不應該阻止整個備份流程，只記錄警告
+						fmt.Printf("Warning: failed to backup clientIdHash file: %v\n", err)
+					}
+				}
+			}
+		}
+	}
+
 	// 備份 Machine ID
 	rawMachineID, err := machineid.GetRawMachineId()
 	if err != nil {
@@ -209,6 +241,15 @@ func CreateBackup(name string) error {
 	}
 
 	return nil
+}
+
+// isIdCAuth 判斷是否為 IdC 認證類型
+func isIdCAuth(authMethod string) bool {
+	if authMethod == "" {
+		return false
+	}
+	lower := strings.ToLower(authMethod)
+	return lower == "idc" || lower == "identitycenter"
 }
 
 // copyFile 複製檔案
@@ -267,6 +308,26 @@ func RestoreBackup(name string) error {
 
 	if err := copyFile(tokenSrcPath, tokenDstPath); err != nil {
 		return fmt.Errorf("failed to restore token: %w", err)
+	}
+
+	// 讀取備份的 token 以檢查是否需要恢復 IdC 的 clientIdHash 文件
+	token, err := ReadBackupToken(name)
+	if err == nil && token != nil {
+		// 如果是 IdC 認證且有 clientIdHash，恢復對應的 clientId/clientSecret 文件
+		if isIdCAuth(token.AuthMethod) && token.ClientIdHash != "" {
+			clientIdHashFile := token.ClientIdHash + ".json"
+			clientIdHashSrcPath := filepath.Join(backupPath, clientIdHashFile)
+			if _, err := os.Stat(clientIdHashSrcPath); err == nil {
+				ssoCachePath, err := awssso.GetSSOCachePath()
+				if err == nil {
+					clientIdHashDstPath := filepath.Join(ssoCachePath, clientIdHashFile)
+					if err := copyFile(clientIdHashSrcPath, clientIdHashDstPath); err != nil {
+						// 恢復 clientIdHash 文件失敗不應該阻止整個恢復流程，只記錄警告
+						fmt.Printf("Warning: failed to restore clientIdHash file: %v\n", err)
+					}
+				}
+			}
+		}
 	}
 
 	return nil
@@ -461,4 +522,190 @@ func ReadBackupToken(name string) (*awssso.KiroAuthToken, error) {
 	}
 
 	return &token, nil
+}
+
+// ReadBackupIdCCredentials 從備份目錄讀取 IdC 的 clientId 和 clientSecret
+// 根據 token 中的 clientIdHash 查找對應的 JSON 文件
+func ReadBackupIdCCredentials(name string, clientIdHash string) (clientID, clientSecret string, err error) {
+	if name == "" {
+		return "", "", ErrInvalidBackupName
+	}
+
+	if clientIdHash == "" {
+		return "", "", fmt.Errorf("clientIdHash is empty")
+	}
+
+	if !BackupExists(name) {
+		return "", "", ErrBackupNotFound
+	}
+
+	backupPath, err := GetBackupPath(name)
+	if err != nil {
+		return "", "", err
+	}
+
+	// 讀取 clientIdHash 對應的 JSON 文件
+	clientIdHashFile := clientIdHash + ".json"
+	clientIdHashPath := filepath.Join(backupPath, clientIdHashFile)
+
+	data, err := os.ReadFile(clientIdHashPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read clientIdHash file: %w", err)
+	}
+
+	// 解析 JSON 文件
+	var cacheFile struct {
+		ClientID     string `json:"clientId"`
+		ClientSecret string `json:"clientSecret"`
+	}
+	if err := json.Unmarshal(data, &cacheFile); err != nil {
+		return "", "", fmt.Errorf("failed to parse clientIdHash file: %w", err)
+	}
+
+	if cacheFile.ClientID == "" || cacheFile.ClientSecret == "" {
+		return "", "", fmt.Errorf("clientId or clientSecret not found in file")
+	}
+
+	return cacheFile.ClientID, cacheFile.ClientSecret, nil
+}
+
+// ReadUsageCache 讀取備份的餘額緩存
+func ReadUsageCache(name string) (*UsageCache, error) {
+	if name == "" {
+		return nil, ErrInvalidBackupName
+	}
+
+	if !BackupExists(name) {
+		return nil, ErrBackupNotFound
+	}
+
+	backupPath, err := GetBackupPath(name)
+	if err != nil {
+		return nil, err
+	}
+
+	cachePath := filepath.Join(backupPath, UsageCacheFileName)
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read usage cache file: %w", err)
+	}
+
+	var cache UsageCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return nil, fmt.Errorf("failed to parse usage cache file: %w", err)
+	}
+
+	return &cache, nil
+}
+
+// WriteUsageCache 寫入備份的餘額緩存
+func WriteUsageCache(name string, cache *UsageCache) error {
+	if name == "" {
+		return ErrInvalidBackupName
+	}
+
+	if cache == nil {
+		return fmt.Errorf("cache cannot be nil")
+	}
+
+	if !BackupExists(name) {
+		return ErrBackupNotFound
+	}
+
+	backupPath, err := GetBackupPath(name)
+	if err != nil {
+		return err
+	}
+
+	// 設定緩存時間
+	cache.CachedAt = time.Now()
+
+	cacheData, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal usage cache: %w", err)
+	}
+
+	cachePath := filepath.Join(backupPath, UsageCacheFileName)
+	if err := os.WriteFile(cachePath, cacheData, 0644); err != nil {
+		return fmt.Errorf("failed to write usage cache: %w", err)
+	}
+
+	return nil
+}
+
+
+// orderedKiroAuthToken 用於確保 JSON 輸出時 key 的順序
+// 順序: accessToken, refreshToken, profileArn, expiresAt, authMethod, provider
+type orderedKiroAuthToken struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	ProfileArn   string `json:"profileArn"`
+	ExpiresAt    string `json:"expiresAt"`
+	AuthMethod   string `json:"authMethod"`
+	Provider     string `json:"provider"`
+}
+
+// WriteBackupToken 將刷新後的 Token 寫入備份檔案
+// 保留原有欄位，僅更新 accessToken、expiresAt
+// 確保 JSON key 順序: accessToken, refreshToken, profileArn, expiresAt, authMethod, provider
+// 需求: 3.1, 3.2, 3.3
+func WriteBackupToken(name string, accessToken string, expiresAt string) error {
+	if name == "" {
+		return ErrInvalidBackupName
+	}
+
+	if !BackupExists(name) {
+		return ErrBackupNotFound
+	}
+
+	backupPath, err := GetBackupPath(name)
+	if err != nil {
+		return err
+	}
+
+	tokenPath := filepath.Join(backupPath, KiroAuthTokenFile)
+
+	// 讀取現有 token 檔案以保留原始欄位
+	data, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return fmt.Errorf("failed to read existing token file: %w", err)
+	}
+
+	// 先解析到 map 以讀取原始值
+	var tokenMap map[string]interface{}
+	if err := json.Unmarshal(data, &tokenMap); err != nil {
+		return fmt.Errorf("failed to parse existing token file: %w", err)
+	}
+
+	// 使用有序結構體來確保 key 順序
+	orderedToken := orderedKiroAuthToken{
+		AccessToken:  accessToken,
+		RefreshToken: getStringFromMap(tokenMap, "refreshToken"),
+		ProfileArn:   getStringFromMap(tokenMap, "profileArn"),
+		ExpiresAt:    expiresAt,
+		AuthMethod:   getStringFromMap(tokenMap, "authMethod"),
+		Provider:     getStringFromMap(tokenMap, "provider"),
+	}
+
+	// 將更新後的 token 寫回檔案
+	updatedData, err := json.MarshalIndent(orderedToken, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated token: %w", err)
+	}
+
+	if err := os.WriteFile(tokenPath, updatedData, 0644); err != nil {
+		return fmt.Errorf("failed to write token file: %w", err)
+	}
+
+	return nil
+}
+
+// getStringFromMap 從 map 中安全地取得字串值
+func getStringFromMap(m map[string]interface{}, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
 }

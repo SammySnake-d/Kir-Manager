@@ -13,11 +13,12 @@ import (
 
 const (
 	// PatchMarker 用於識別是否已 patch 的標記
-	PatchMarker    = "/* KIRO_MANAGER_PATCH_V2 */"
+	PatchMarker    = "/* KIRO_MANAGER_PATCH_V3 */"
 	PatchEndMarker = "/* END_KIRO_MANAGER_PATCH */"
 	BackupSuffix   = ".kiro-manager-backup"
 	// OldPatchMarker 用於識別舊版 patch，需要重新 patch
-	OldPatchMarker = "/* KIRO_MANAGER_PATCH_V1 */"
+	OldPatchMarker   = "/* KIRO_MANAGER_PATCH_V1 */"
+	OldPatchMarkerV2 = "/* KIRO_MANAGER_PATCH_V2 */"
 )
 
 var (
@@ -28,46 +29,101 @@ var (
 )
 
 // patchCode 注入的 JavaScript 程式碼
-const patchCode = `/* KIRO_MANAGER_PATCH_V2 */
+// V3: 底層全面攔截 - 覆蓋 vscode.env.machineId, node-machine-id, child_process, fs
+const patchCode = `/* KIRO_MANAGER_PATCH_V3 */
 (function() {
   const fs = require('fs');
   const path = require('path');
   const os = require('os');
+  const childProcess = require('child_process');
   const customIdPath = path.join(os.homedir(), '.kiro', 'custom-machine-id');
   let customMachineId = null;
   try {
     customMachineId = fs.readFileSync(customIdPath, 'utf8').trim();
   } catch {}
-  if (customMachineId) {
-    const Module = require('module');
-    const originalLoad = Module._load;
-    Module._load = function(request, parent, isMain) {
-      const mod = originalLoad.call(this, request, parent, isMain);
-      if (request === 'vscode') {
-        return new Proxy(mod, {
-          get(target, prop) {
-            if (prop === 'env') {
-              return new Proxy(target.env, {
-                get(envTarget, envProp) {
-                  if (envProp === 'machineId') return customMachineId;
-                  return envTarget[envProp];
-                }
-              });
-            }
-            return target[prop];
+  if (!customMachineId) return;
+
+  // 1. 攔截 Module._load（vscode.env.machineId 和 node-machine-id）
+  const Module = require('module');
+  const originalLoad = Module._load;
+  Module._load = function(request, parent, isMain) {
+    const mod = originalLoad.call(this, request, parent, isMain);
+    if (request === 'vscode') {
+      return new Proxy(mod, {
+        get(target, prop) {
+          if (prop === 'env') {
+            return new Proxy(target.env, {
+              get(envTarget, envProp) {
+                if (envProp === 'machineId') return customMachineId;
+                return envTarget[envProp];
+              }
+            });
           }
-        });
-      }
-      if (mod && typeof mod === 'object' && (typeof mod.machineIdSync === 'function' || typeof mod.machineId === 'function')) {
-        return new Proxy(mod, {
-          get(target, prop) {
-            if (prop === 'machineIdSync') return function() { return customMachineId; };
-            if (prop === 'machineId') return function() { return Promise.resolve(customMachineId); };
-            return target[prop];
-          }
-        });
-      }
-      return mod;
+          return target[prop];
+        }
+      });
+    }
+    if (mod && typeof mod === 'object' && (typeof mod.machineIdSync === 'function' || typeof mod.machineId === 'function')) {
+      return new Proxy(mod, {
+        get(target, prop) {
+          if (prop === 'machineIdSync') return () => customMachineId;
+          if (prop === 'machineId') return () => Promise.resolve(customMachineId);
+          return target[prop];
+        }
+      });
+    }
+    return mod;
+  };
+
+  // 2. 攔截 child_process（針對 @opentelemetry 和其他直接執行命令的模組）
+  const machineIdPatterns = [
+    'REG.exe QUERY', 'REG QUERY', 'MachineGuid',
+    'ioreg', 'IOPlatformExpertDevice',
+    'kenv', 'smbios.system.uuid', 'kern.hostuuid'
+  ];
+  const isMachineIdCmd = (cmd) => cmd && machineIdPatterns.some(p => cmd.includes(p));
+
+  const originalExec = childProcess.exec;
+  childProcess.exec = function(cmd, options, callback) {
+    if (isMachineIdCmd(cmd)) {
+      if (typeof options === 'function') { callback = options; options = {}; }
+      setImmediate(() => callback && callback(null, customMachineId, ''));
+      return { on: () => {}, stdout: { on: () => {} }, stderr: { on: () => {} } };
+    }
+    return originalExec.apply(this, arguments);
+  };
+
+  const originalExecSync = childProcess.execSync;
+  childProcess.execSync = function(cmd, options) {
+    if (isMachineIdCmd(cmd)) return Buffer.from(customMachineId);
+    return originalExecSync.apply(this, arguments);
+  };
+
+  // 3. 攔截 fs（針對 Linux /etc/machine-id）
+  const machineIdPaths = ['/etc/machine-id', '/var/lib/dbus/machine-id', '/etc/hostid'];
+  const isMachineIdPath = (p) => p && machineIdPaths.some(mp => String(p).includes(mp));
+
+  const originalReadFile = fs.readFile;
+  fs.readFile = function(filePath, options, callback) {
+    if (isMachineIdPath(filePath)) {
+      if (typeof options === 'function') { callback = options; }
+      setImmediate(() => callback && callback(null, customMachineId));
+      return;
+    }
+    return originalReadFile.apply(this, arguments);
+  };
+
+  const originalReadFileSync = fs.readFileSync;
+  fs.readFileSync = function(filePath, options) {
+    if (isMachineIdPath(filePath)) return customMachineId;
+    return originalReadFileSync.apply(this, arguments);
+  };
+
+  if (fs.promises) {
+    const originalPromisesReadFile = fs.promises.readFile;
+    fs.promises.readFile = async function(filePath, options) {
+      if (isMachineIdPath(filePath)) return customMachineId;
+      return originalPromisesReadFile.apply(this, arguments);
     };
   }
 })();
@@ -128,7 +184,7 @@ func IsPatched() (bool, error) {
 	return strings.Contains(string(buf[:n]), PatchMarker), nil
 }
 
-// IsOldPatched 檢查 extension.js 是否被舊版 patch
+// IsOldPatched 檢查 extension.js 是否被舊版 patch（V1 或 V2）
 func IsOldPatched() (bool, error) {
 	extPath, err := GetExtensionJSPath()
 	if err != nil {
@@ -148,8 +204,10 @@ func IsOldPatched() (bool, error) {
 	}
 
 	content := string(buf[:n])
-	// 有舊版標記但沒有新版標記
-	return strings.Contains(content, OldPatchMarker) && !strings.Contains(content, PatchMarker), nil
+	// 有舊版標記（V1 或 V2）但沒有新版標記（V3）
+	hasOldPatch := strings.Contains(content, OldPatchMarker) || strings.Contains(content, OldPatchMarkerV2)
+	hasCurrentPatch := strings.Contains(content, PatchMarker)
+	return hasOldPatch && !hasCurrentPatch, nil
 }
 
 // BackupExtensionJS 備份原始 extension.js
@@ -182,7 +240,15 @@ func RestoreExtensionJS() error {
 		return ErrBackupNotFound
 	}
 
-	return copyFile(backupPath, extPath)
+	// 還原檔案
+	if err := copyFile(backupPath, extPath); err != nil {
+		return err
+	}
+
+	// 還原成功後刪除備份檔案
+	_ = os.Remove(backupPath)
+
+	return nil
 }
 
 // PatchExtensionJS 在 extension.js 開頭注入攔截程式碼
