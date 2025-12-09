@@ -19,7 +19,7 @@ jobs:
             platform: darwin/arm64
             output:  kiro-manager-darwin-arm64
             artifact_name: kiro-manager-darwin-arm64.dmg
-          - os: macos-13
+          - os: macos-15-intel
             platform: darwin/amd64
             output: kiro-manager-darwin-amd64
             artifact_name: kiro-manager-darwin-amd64.dmg
