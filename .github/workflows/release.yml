@@ -43,6 +43,12 @@ jobs:
       - name: Create DMG (macOS)
         run: |
           brew install create-dmg
+          APP_PATH=$(find build/bin -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app bundle found under build/bin"
+            exit 1
+          fi
+          APP_NAME=$(basename "$APP_PATH")
           # Ensure icon exists (fallback if missing)
           if [ -f "build/appicon.png" ]; then
             create-dmg \
@@ -51,21 +57,22 @@ jobs:
               --window-pos 200 120 \
               --window-size 600 400 \
               --icon-size 100 \
-              --icon "${{ matrix.output }}.app" 150 185 \
+              --icon "$APP_NAME" 150 185 \
               --app-drop-link 450 185 \
               --no-internet-enable \
               "${{ matrix.artifact_name }}" \
-              "build/bin/${{ matrix.output }}.app"
+              "$APP_PATH"
           else
             create-dmg \
               --volname "Kiro Manager" \
               --window-pos 200 120 \
               --window-size 600 400 \
               --icon-size 100 \
+              --icon "$APP_NAME" 150 185 \
               --app-drop-link 450 185 \
               --no-internet-enable \
               "${{ matrix.artifact_name }}" \
-              "build/bin/${{ matrix.output }}.app"
+              "$APP_PATH"
           fi
       - name: Upload macOS DMG Artifact
         uses: actions/upload-artifact@v4
