@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*'
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -16,9 +18,11 @@ jobs:
           - os: macos-latest
             platform: darwin/universal
             output: kiro-manager-darwin-universal
+            artifact_path: build/bin/kiro-manager-darwin-universal.zip
           - os: ubuntu-22.04
             platform: linux/amd64
             output: kiro-manager-linux-amd64
+            artifact_path: build/bin/kiro-manager-linux-amd64
 
     runs-on: ${{ matrix.os }}
 
@@ -48,11 +52,15 @@ jobs:
       - name: Build
         run: wails build -platform ${{ matrix.platform }} -o ${{ matrix.output }}
 
+      - name: Package macOS app bundle
+        if: matrix.os == 'macos-latest'
+        run: ditto -c -k --sequesterRsrc --keepParent build/bin/kiro-manager.app build/bin/${{ matrix.output }}.zip
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.output }}
-          path: build/bin/${{ matrix.output }}
+          path: ${{ matrix.artifact_path }}
 
   release:
     needs: build
