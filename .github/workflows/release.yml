@@ -44,11 +44,15 @@ jobs:
         run: |
           brew install create-dmg
           APP_PATH=$(find build/bin -maxdepth 1 -name "*.app" | head -n 1)
+          APP_COUNT=$(find build/bin -maxdepth 1 -name "*.app" | wc -l | tr -d ' ')
+          if [ "$APP_COUNT" -gt 1 ]; then
+            echo "Multiple app bundles found under build/bin, using first match: $APP_PATH"
+          fi
           if [ -z "$APP_PATH" ]; then
             echo "No .app bundle found under build/bin"
             exit 1
           fi
-          APP_NAME=$(basename "$APP_PATH")
+          APP_NAME="$(basename "$APP_PATH")"
           # Ensure icon exists (fallback if missing)
           if [ -f "build/appicon.png" ]; then
             create-dmg \
